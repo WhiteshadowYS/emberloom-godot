@@ -4,7 +4,7 @@
 # Fails loudly on the first conflict (git am leaves the tree in the conflicted state for inspection).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-read -r TAG SHA < "$ROOT/BASE"
+read -r TAG SHA < <(tr -d "\r" < "$ROOT/BASE")
 [ -n "${TAG:-}" ] && [ -n "${SHA:-}" ] || { echo "apply.sh: BASE must be '<tag> <commit>'" >&2; exit 1; }
 SRC="${GODOT_SRC:-$ROOT/godot}"
 
@@ -29,4 +29,4 @@ for p in "$ROOT"/patches/[0-9]*.patch; do
   git am --3way --keep-cr "$p" || { echo "apply.sh: CONFLICT in $(basename "$p") — resolve in $SRC, then 'git am --continue'" >&2; exit 2; }
   n=$((n+1))
 done
-echo "apply.sh: $TAG + $n patch(es) → $(git rev-parse --short HEAD) ($(cat "$ROOT/VERSION"))" >&2
+echo "apply.sh: $TAG + $n patch(es) → $(git rev-parse --short HEAD) ($(tr -d "\r" < "$ROOT/VERSION"))" >&2
