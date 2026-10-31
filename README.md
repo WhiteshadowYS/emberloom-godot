@@ -50,5 +50,12 @@ Design and rationale: `ws_cortex/workspace/dev/projects/build-arena/research/202
 Artefacts land in `godot/bin/`. CI runs the same script per matrix entry and publishes the Release when `VERSION`
 changes on `main` (or on manual dispatch).
 
+## Licence
+
+Everything in this repository — the patches, the scripts, the workflow — is **MIT** (`LICENSE`), the same licence as
+Godot, so every patch can be sent upstream unchanged. The built binaries are Godot: they carry Godot's own MIT licence and
+the third-party notices in the engine's `COPYRIGHT.txt` / `thirdparty/` (the Release notes point there). Vendor SDKs the
+game's extension may load at runtime (NGX, FidelityFX, XeSS) are **not** part of this package and keep their own licences.
+
 Git flow: `auto` (agent commits and pushes after review; 1-line Conventional Commits; no AI trailers) — same
 owner rules as `build-arena`.
