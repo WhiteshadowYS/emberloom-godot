@@ -1,0 +1,4 @@
+godot/
+.scons_cache/
+out/
+*.log

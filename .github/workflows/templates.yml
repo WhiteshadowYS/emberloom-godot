@@ -1,0 +1,143 @@
+name: templates
+# Builds the Ember World engine package (stock BASE + patches/) and publishes Release v<VERSION>:
+#   linux editor · linux x86_64 release template · windows x86_64 release template (MSVC, d3d12 + vulkan) · sha256sums.txt
+# Runs on every push to main that touches the package and on manual dispatch; the Release is created only when
+# the tag v<VERSION> does not exist yet (bump VERSION to publish a new revision).
+on:
+  push:
+    branches: [main]
+    paths: [BASE, VERSION, build.sh, apply.sh, 'patches/**', '.github/workflows/templates.yml']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "create / update the GitHub Release v<VERSION>"
+        type: boolean
+        default: true
+
+concurrency:
+  group: templates-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SCONSFLAGS: verbose=no progress=no
+  SCONS_CACHE_LIMIT: 7168
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      base_tag: ${{ steps.v.outputs.base_tag }}
+      base_sha: ${{ steps.v.outputs.base_sha }}
+      exists: ${{ steps.v.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          v="$(tr -d '[:space:]' < VERSION)"; read -r tag sha < BASE
+          echo "version=$v" >> "$GITHUB_OUTPUT"; echo "base_tag=$tag" >> "$GITHUB_OUTPUT"; echo "base_sha=$sha" >> "$GITHUB_OUTPUT"
+          if gh release view "v$v" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then echo "exists=true" >> "$GITHUB_OUTPUT"; else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
+
+  build:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-editor,   os: ubuntu-24.04,   what: editor,  out: "godot.linuxbsd.editor.x86_64",            asset: "godot.linuxbsd.editor.x86_64" }
+          - { name: linux-template, os: ubuntu-24.04,   what: linux,   out: "godot.linuxbsd.template_release.x86_64",  asset: "linux_release.x86_64" }
+          - { name: windows-template, os: windows-2022, what: windows, out: "godot.windows.template_release.x86_64.exe", asset: "windows_release_x86_64.exe" }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q build-essential scons pkg-config libx11-dev libxcursor-dev libxinerama-dev \
+            libgl1-mesa-dev libglu1-mesa-dev libasound2-dev libpulse-dev libudev-dev libxi-dev libxrandr-dev \
+            libwayland-dev libdbus-1-dev libspeechd-dev libfontconfig-dev
+
+      - name: windows deps (scons + D3D12 SDKs, the official recipe)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip scons
+          scons --version
+
+      - name: scons cache
+        uses: actions/cache@v4
+        with:
+          path: .scons_cache
+          key: scons-${{ matrix.name }}-${{ needs.meta.outputs.base_sha }}-${{ hashFiles('patches/**', 'build.sh') }}
+          restore-keys: |
+            scons-${{ matrix.name }}-${{ needs.meta.outputs.base_sha }}-
+            scons-${{ matrix.name }}-
+
+      - name: apply (stock BASE + patches)
+        shell: bash
+        run: ./apply.sh
+
+      - name: D3D12 SDKs (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cd godot && python misc/scripts/install_d3d12_sdk_windows.py
+
+      - name: build
+        shell: bash
+        env:
+          SCONS_JOBS: 4
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            ./build.sh windows d3d12=yes
+          else
+            ./build.sh ${{ matrix.what }}
+          fi
+          ls -la godot/bin
+
+      - name: strip + rename
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "godot/bin/${{ matrix.out }}" "out/${{ matrix.asset }}"
+          if [ "$RUNNER_OS" = Linux ]; then strip "out/${{ matrix.asset }}"; fi
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+          compression-level: 6
+
+  release:
+    needs: [meta, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && (github.event_name == 'push' || inputs.publish) }}
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: sums + notes
+        run: |
+          cd dist && sha256sum * > sha256sums.txt && cat sha256sums.txt && cd ..
+          v="${{ needs.meta.outputs.version }}"
+          { echo "Ember World engine package **$v** — stock Godot \`${{ needs.meta.outputs.base_tag}}\` (\`${{ needs.meta.outputs.base_sha }}\`) + $(ls patches/[0-9]*.patch 2>/dev/null | wc -l) patch(es)."
+            echo; echo "Patches:"; ls patches/[0-9]*.patch 2>/dev/null | sed 's|^|- |' || true
+            echo; echo "Flags: see \`build.sh\` and \`patches/README.md\` (build-flag changes)."
+            echo; echo "Assets: linux editor, linux + windows release templates, \`sha256sums.txt\`. Pinned by build-arena \`engine/VERSION\`."; } > notes.md
+      - name: publish v${{ needs.meta.outputs.version }}
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          v="v${{ needs.meta.outputs.version }}"
+          if [ "${{ needs.meta.outputs.exists }}" = true ]; then
+            gh release upload "$v" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$v" --notes-file notes.md --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$v" dist/* --title "$v" --notes-file notes.md --target "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
+          fi
