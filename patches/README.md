@@ -18,3 +18,4 @@ A patch is dropped the day upstream ships its equivalent. Keep this table and th
 | Rev | Change | Why |
 |---|---|---|
 | el.0 | `production=yes` (LTO full, `optimize=speed`, static libstdc++), `module_openxr_enabled=no`, `module_mobile_vr_enabled=no`, `module_webxr_enabled=no` | the game has no XR; everything else stays until a module audit measures a saving |
+| el.0.1 | XR modules back **on** (`production=yes` only) | el.0 broke every GDExtension built with godot-rust: gdext loads the method binds of all classes in the stock API at init and panics on the missing `OpenXRExtensionWrapper` / `MobileVRInterface` / `WebXRInterface`. Rule: a module that registers classes stays on (class list must equal stock's `--dump-extension-api`) |

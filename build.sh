@@ -7,9 +7,10 @@ SRC="${GODOT_SRC:-$ROOT/godot}"
 what="${1:-}"; shift || true
 [ -d "$SRC" ] || { echo "build.sh: run ./apply.sh first" >&2; exit 1; }
 
-# Common flags (ledger "Build-flag changes"): production = LTO full + optimize=speed + static libstdc++; XR off.
-COMMON=(production=yes module_openxr_enabled=no module_mobile_vr_enabled=no module_webxr_enabled=no
-        verbose=no progress=no)
+# Common flags (ledger "Build-flag changes"): production = LTO full + optimize=speed + static libstdc++.
+# Never disable a module that registers classes: godot-rust (gdext) binds every class of the stock
+# extension_api.json at load and panics on a missing one (el.0 lesson: XR off → OpenXRExtensionWrapper panic).
+COMMON=(production=yes verbose=no progress=no)
 JOBS="${SCONS_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu)}"
 export SCONS_CACHE="${SCONS_CACHE:-$ROOT/.scons_cache}"
 

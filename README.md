@@ -17,7 +17,7 @@ Design and rationale: `ws_cortex/workspace/dev/projects/build-arena/research/202
 | `patches/NNNN-<slug>.patch` | one upstream-shaped commit each, applied in numeric order by `apply.sh` |
 | `patches/README.md` | the **patch ledger** — purpose · files · LOC · upstream PR · status · last rebase · notes |
 | `apply.sh` | clone the base at the pinned commit into `godot/` and `git am` every patch; fails loudly on the first conflict |
-| `build.sh` | SCons wrapper with the Ember World flags (production, LTO, XR modules off) — the same command locally, on the Mac and in CI |
+| `build.sh` | SCons wrapper with the Ember World flags (production + LTO; no module that registers classes may be disabled) — the same command locally, on the Mac and in CI |
 | `.github/workflows/templates.yml` | builds Linux editor + Linux / Windows release templates, publishes the Release with `sha256sums.txt` |
 | `smoke/` | (from el.1) a Godot project that exercises every hook the patches add |
 | `CHANGELOG.md` | one entry per revision: base, patches in / out, flag changes |
