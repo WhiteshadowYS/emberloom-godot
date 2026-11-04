@@ -43,7 +43,7 @@ Design and rationale: `ws_cortex/workspace/dev/projects/build-arena/research/202
 ./apply.sh                 # godot/ = stock BASE + patches (idempotent; re-clones when BASE changed)
 ./build.sh editor          # Linux editor (this host)
 ./build.sh linux           # Linux x86_64 release template
-./build.sh windows         # Windows x86_64 release template (MSVC on Windows, mingw elsewhere)
+./build.sh windows         # Windows x86_64 release template (MinGW-GCC, the official toolchain; never MSVC)
 ./build.sh macos           # macOS universal template (macOS host only)
 ```
 

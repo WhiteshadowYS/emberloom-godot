@@ -1,6 +1,7 @@
 name: templates
 # Builds the Ember World engine package (stock BASE + patches/) and publishes Release v<VERSION>:
-#   linux editor · linux x86_64 release template · windows x86_64 release template (MSVC, d3d12 + vulkan) · sha256sums.txt
+#   linux editor · linux x86_64 release template · windows x86_64 release template (MinGW-GCC cross build in a
+#   Fedora container = the official toolchain; d3d12 + vulkan + ANGLE + AccessKit) · sha256sums.txt
 # Runs on every push to main that touches the package and on manual dispatch; the Release is created only when
 # the tag v<VERSION> does not exist yet (bump VERSION to publish a new revision).
 on:
@@ -47,27 +48,33 @@ jobs:
         include:
           - { name: linux-editor,   os: ubuntu-24.04,   what: editor,  out: "godot.linuxbsd.editor.x86_64",            asset: "godot.linuxbsd.editor.x86_64" }
           - { name: linux-template, os: ubuntu-24.04,   what: linux,   out: "godot.linuxbsd.template_release.x86_64",  asset: "linux_release.x86_64" }
-          - { name: windows-template, os: windows-2022, what: windows, out: "godot.windows.template_release.x86_64.exe", asset: "windows_release_x86_64.exe" }
+          - { name: windows-template, os: ubuntu-24.04, container: "fedora:43", what: windows, out: "godot.windows.template_release.x86_64.exe", asset: "windows_release_x86_64.exe" }
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # Windows: the official recipe (godot-build-scripts build-windows) = Fedora MinGW-GCC, never MSVC (PRG: MSVC
+    # turns LTO off under production and loses the GDScript VM's computed-goto dispatch).
+    container: ${{ matrix.container || '' }}
     timeout-minutes: 360
     steps:
+      - name: fedora mingw toolchain (windows)
+        if: matrix.what == 'windows'
+        run: |
+          # = godotengine/build-containers Dockerfile.base + .windows; fedora:43 = the GCC 15.2.1 (fc43) that
+          # built the official 4.7.2-stable Windows templates (`strings` of the stock exe)
+          dnf install -y -q --setopt=install_weak_deps=False bash binutils bzip2 curl file findutils git make \
+            patch pkgconfig python3-pip unzip which xz mingw64-gcc mingw64-gcc-c++ mingw64-winpthreads-static
+          python3 -m pip install -q scons==4.10.1
+          x86_64-w64-mingw32-gcc --version | head -1; scons --version | tail -1
+
       - uses: actions/checkout@v4
 
       - name: linux deps
-        if: runner.os == 'Linux'
+        if: matrix.what != 'windows'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q build-essential scons pkg-config libx11-dev libxcursor-dev libxinerama-dev \
             libgl1-mesa-dev libglu1-mesa-dev libasound2-dev libpulse-dev libudev-dev libxi-dev libxrandr-dev \
             libwayland-dev libdbus-1-dev libspeechd-dev libfontconfig-dev
-
-      - name: windows deps (scons + D3D12 SDKs, the official recipe)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          python -m pip install --upgrade pip scons
-          scons --version
 
       - name: scons cache
         uses: actions/cache@v4
@@ -82,18 +89,24 @@ jobs:
         shell: bash
         run: ./apply.sh
 
-      - name: D3D12 SDKs (windows)
-        if: runner.os == 'Windows'
+      - name: D3D12 SDKs + ANGLE + AccessKit (windows, into godot/bin/build_deps like the official build)
+        if: matrix.what == 'windows'
         shell: bash
-        run: cd godot && python misc/scripts/install_d3d12_sdk_windows.py
+        run: |
+          cd godot
+          python3 misc/scripts/install_d3d12_sdk_windows.py
+          python3 misc/scripts/install_angle.py
+          python3 misc/scripts/install_accesskit.py
+          ls bin/build_deps
 
       - name: build
         shell: bash
         env:
           SCONS_JOBS: 4
         run: |
-          if [ "$RUNNER_OS" = Windows ]; then
+          if [ "${{ matrix.what }}" = windows ]; then
             ./build.sh windows d3d12=yes
+            x86_64-w64-mingw32-objdump -p godot/bin/${{ matrix.out }} | grep -E 'LinkerVersion'
           else
             ./build.sh ${{ matrix.what }}
           fi
@@ -104,7 +117,7 @@ jobs:
         run: |
           mkdir -p out
           cp "godot/bin/${{ matrix.out }}" "out/${{ matrix.asset }}"
-          if [ "$RUNNER_OS" = Linux ]; then strip "out/${{ matrix.asset }}"; fi
+          if [ "${{ matrix.what }}" = windows ]; then x86_64-w64-mingw32-strip "out/${{ matrix.asset }}"; else strip "out/${{ matrix.asset }}"; fi
           ls -la out
 
       - uses: actions/upload-artifact@v4
