@@ -120,12 +120,30 @@ jobs:
           if [ "${{ matrix.what }}" = windows ]; then x86_64-w64-mingw32-strip "out/${{ matrix.asset }}"; else strip "out/${{ matrix.asset }}"; fi
           ls -la out
 
+      # The patched API (new classes / methods / enums) for GDExtensions that use the hooks: godot-rust
+      # `api-custom-json` (GODOT4_GDEXTENSION_JSON) reads this file. Stock-API extensions keep working unchanged.
+      - name: extension_api.json (editor)
+        if: matrix.what == 'editor'
+        shell: bash
+        run: |
+          cd out && "./${{ matrix.asset }}" --headless --dump-extension-api && ls -la extension_api.json
+          for c in ViewportUpscaler; do grep -q "\"name\": \"$c\"" extension_api.json || { echo "missing class $c" >&2; exit 1; }; done
+          for m in get_taa_jitter driver_callback_add viewport_reset_accumulation get_upscaled_layer get_reset_accumulation; do
+            grep -q "\"name\": \"$m\"" extension_api.json || { echo "missing method $m" >&2; exit 1; }; done
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: out/${{ matrix.asset }}
           if-no-files-found: error
           compression-level: 6
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.what == 'editor'
+        with:
+          name: extension_api.json
+          path: out/extension_api.json
+          if-no-files-found: error
 
   release:
     needs: [meta, build]
@@ -143,7 +161,7 @@ jobs:
           { echo "Ember World engine package **$v** — stock Godot \`${{ needs.meta.outputs.base_tag}}\` (\`${{ needs.meta.outputs.base_sha }}\`) + $(ls patches/[0-9]*.patch 2>/dev/null | wc -l) patch(es)."
             echo; echo "Patches:"; ls patches/[0-9]*.patch 2>/dev/null | sed 's|^|- |' || true
             echo; echo "Flags: see \`build.sh\` and \`patches/README.md\` (build-flag changes)."
-            echo; echo "Assets: linux editor, linux + windows release templates, \`sha256sums.txt\`. Pinned by build-arena \`engine/VERSION\`."; } > notes.md
+            echo; echo "Assets: linux editor, linux + windows release templates, \`extension_api.json\` (patched API for godot-rust \`api-custom-json\`), \`sha256sums.txt\`. Pinned by build-arena \`engine/VERSION\`."; } > notes.md
       - name: publish v${{ needs.meta.outputs.version }}
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |

@@ -1,0 +1,97 @@
+From 5cb838fc04349c7ecdc394ba442ab9fd30dbb04c Mon Sep 17 00:00:00 2001
+From: emberloom-godot <emberloom-godot@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:36:45 +0200
+Subject: [PATCH 5/7] Add project settings for extra Vulkan instance and device
+ extensions
+
+rendering/rendering_device/vulkan/extra_instance_extensions and
+extra_device_extensions are requested as optional extensions, so native SDKs
+loaded by a GDExtension (NGX, FidelityFX, XeSS, anti-lag) get what they need.
+---
+ core/config/project_settings.cpp                   |  2 ++
+ doc/classes/ProjectSettings.xml                    |  8 ++++++++
+ drivers/vulkan/rendering_context_driver_vulkan.cpp | 12 ++++++++++++
+ drivers/vulkan/rendering_device_driver_vulkan.cpp  | 12 ++++++++++++
+ 4 files changed, 34 insertions(+)
+
+diff --git a/core/config/project_settings.cpp b/core/config/project_settings.cpp
+index 0e078c32c9..ee6f9dee70 100644
+--- a/core/config/project_settings.cpp
++++ b/core/config/project_settings.cpp
+@@ -1829,6 +1829,8 @@ ProjectSettings::ProjectSettings() {
+ 	GLOBAL_DEF_RST(PropertyInfo(Variant::BOOL, "rendering/rendering_device/pipeline_cache/enable"), true);
+ 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/rendering_device/pipeline_cache/save_chunk_size_mb", PROPERTY_HINT_RANGE, "0.000001,64.0,0.001,or_greater"), 3.0);
+ 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/rendering_device/vulkan/max_descriptors_per_pool", PROPERTY_HINT_RANGE, "1,256,1,or_greater"), 64);
++	GLOBAL_DEF_RST(PropertyInfo(Variant::PACKED_STRING_ARRAY, "rendering/rendering_device/vulkan/extra_instance_extensions"), PackedStringArray());
++	GLOBAL_DEF_RST(PropertyInfo(Variant::PACKED_STRING_ARRAY, "rendering/rendering_device/vulkan/extra_device_extensions"), PackedStringArray());
+ 
+ 	GLOBAL_DEF_RST("rendering/rendering_device/d3d12/max_resource_descriptors", 65536);
+ 	custom_prop_info["rendering/rendering_device/d3d12/max_resource_descriptors"] = PropertyInfo(Variant::INT, "rendering/rendering_device/d3d12/max_resource_descriptors", PROPERTY_HINT_RANGE, "512,1000000");
+diff --git a/doc/classes/ProjectSettings.xml b/doc/classes/ProjectSettings.xml
+index 14e3133aee..15a8c32a7b 100644
+--- a/doc/classes/ProjectSettings.xml
++++ b/doc/classes/ProjectSettings.xml
+@@ -3399,6 +3399,14 @@
+ 			[b]Note:[/b] Changes to this setting will only be applied on startup or when the swapchain is recreated (e.g. when setting the V-Sync mode).
+ 			[b]Note:[/b] Some platforms may restrict the actual value.
+ 		</member>
++		<member name="rendering/rendering_device/vulkan/extra_device_extensions" type="PackedStringArray" setter="" getter="" default="PackedStringArray()">
++			Additional Vulkan device extensions to enable when the device supports them (for example the ones a native upscaler or low-latency SDK loaded by a GDExtension requires). Unsupported names are skipped silently.
++			[b]Note:[/b] Changing this property requires a restart to take effect.
++		</member>
++		<member name="rendering/rendering_device/vulkan/extra_instance_extensions" type="PackedStringArray" setter="" getter="" default="PackedStringArray()">
++			Additional Vulkan instance extensions to enable when the loader supports them. Unsupported names are skipped silently.
++			[b]Note:[/b] Changing this property requires a restart to take effect.
++		</member>
+ 		<member name="rendering/rendering_device/vulkan/max_descriptors_per_pool" type="int" setter="" getter="" default="64">
+ 			The number of descriptors per pool. Godot's Vulkan backend uses linear pools for descriptors that will be created and destroyed within a single frame. Instead of destroying every single descriptor every frame, they all can be destroyed at once by resetting the pool they belong to.
+ 			A larger number is more efficient up to a limit, after that it will only waste RAM (maximum efficiency is achieved when there is no more than 1 pool per frame). A small number could end up with one pool per descriptor, which negatively impacts performance.
+diff --git a/drivers/vulkan/rendering_context_driver_vulkan.cpp b/drivers/vulkan/rendering_context_driver_vulkan.cpp
+index fdb6b4a1ac..dd70e2e61a 100644
+--- a/drivers/vulkan/rendering_context_driver_vulkan.cpp
++++ b/drivers/vulkan/rendering_context_driver_vulkan.cpp
+@@ -460,6 +460,18 @@ Error RenderingContextDriverVulkan::_initialize_instance_extensions() {
+ 		_register_requested_instance_extension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, false);
+ 	}
+ 
++	// Extra instance extensions requested by the project (native SDKs: NGX, FidelityFX, XeSS). Optional: enabled
++	// only when the loader reports them. (emberloom-godot P4)
++	if (ProjectSettings::get_singleton() != nullptr) {
++		const PackedStringArray extra_extensions = GLOBAL_GET("rendering/rendering_device/vulkan/extra_instance_extensions");
++		for (const String &extension_name : extra_extensions) {
++			const CharString name = extension_name.strip_edges().utf8();
++			if (name.length() > 0 && !requested_instance_extensions.has(name)) {
++				_register_requested_instance_extension(name, false);
++			}
++		}
++	}
++
+ 	// Load instance extensions that are available.
+ 	uint32_t instance_extension_count = 0;
+ 	VkResult err = vkEnumerateInstanceExtensionProperties(nullptr, &instance_extension_count, nullptr);
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.cpp b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+index 313c78fab7..63a6690e21 100644
+--- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
++++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+@@ -602,6 +602,18 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
+ #endif
+ 	_register_requested_device_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, false);
+ 
++	// Extra device extensions requested by the project (NGX, FidelityFX, XeSS, VK_AMD_anti_lag,
++	// VK_NV_low_latency2). Optional: enabled only when the device reports them. (emberloom-godot P4)
++	if (ProjectSettings::get_singleton() != nullptr) {
++		const PackedStringArray extra_extensions = GLOBAL_GET("rendering/rendering_device/vulkan/extra_device_extensions");
++		for (const String &extension_name : extra_extensions) {
++			const CharString name = extension_name.strip_edges().utf8();
++			if (name.length() > 0 && !requested_device_extensions.has(name)) {
++				_register_requested_device_extension(name, false);
++			}
++		}
++	}
++
+ 	{
+ 		// Debug marker extensions.
+ 		// Should be last element in the array.
+-- 
+2.43.0
+

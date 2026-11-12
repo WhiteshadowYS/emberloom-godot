@@ -1,0 +1,18 @@
+[package]
+name = "upscaler-proof"
+version = "0.1.0"
+edition = "2021"
+description = "el.1 hook proof: a pass-through ViewportUpscaler (bilinear compute blit) written in Rust against the patched API"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Same gdext as build-arena's extension; `api-custom-json` = the patched API from the release asset
+# extension_api.json (GODOT4_GDEXTENSION_JSON=<path>), so ViewportUpscaler & co. get bindings.
+godot = { version = "=0.5.5", features = ["api-custom-json"] }
+
+[profile.release]
+opt-level = 2

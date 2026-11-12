@@ -1,5 +1,20 @@
 # Changelog
 
+## 4.7.2-el.1 — 2026-11-13
+
+- Base: unchanged (`4.7.2-stable`, `ed1daf0bf`). Flags: unchanged (`production=yes`; Windows MinGW-GCC).
+- Patches in (ledger `patches/README.md`): P1 `0010-upscaler-hook` (upstream #114670 as-is) + `0015` fixes,
+  P2 `0020-scene-data-bindings`, P3 `0030-driver-callback`, P4 `0040-vk-extension-injection`,
+  P5 `0050-opaque-copy-reset`, P6 `0060-shader-baker-platform-hash`.
+- API additions only (no stock class / method removed or changed): `ViewportUpscaler`, `Viewport.SCALING_3D_MODE_CUSTOM`
+  + `scaling_3d_custom_upscaler`, `RenderingServer.viewport_upscaler_*` / `viewport_set_scaling_3d_custom_upscaler` /
+  `viewport_reset_accumulation`, `RenderSceneBuffersRD.get_upscaled_texture / get_upscaled_layer /
+  get_scaling_3d_custom_upscaler / get_reset_accumulation`, `RenderSceneData` temporal getters,
+  `RenderingDevice.driver_callback_add` + `DRIVER_RESOURCE_COMMAND_BUFFER` + `CallbackResource*` enums, two
+  `rendering/rendering_device/vulkan/extra_*_extensions` project settings.
+- Behaviour change in stock paths: FSR 2 / MetalFX temporal reset their history on render-buffer reconfigure and on
+  `viewport_reset_accumulation` (stock: never). Shader baker cache hash now includes platform + driver.
+
 ## 4.7.2-el.0.2 — 2026-11-04
 
 - Base: unchanged (`4.7.2-stable`, `ed1daf0bf`). Patches: none. Flags: `production=yes` (unchanged).
