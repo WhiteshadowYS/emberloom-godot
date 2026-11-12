@@ -1,0 +1,34 @@
+From 0340e9548ea6f5fd3c258adaffcf831b34bb06df Mon Sep 17 00:00:00 2001
+From: emberloom-godot <emberloom-godot@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:37:00 +0200
+Subject: [PATCH 7/7] Include the export platform and driver in the shader
+ baker cache hash
+
+The export file cache was keyed on engine version and renderer only, so a second
+baked preset reused the first preset's customized resources and baked only the
+engine's own shaders (Windows after Linux: 28 of 105 shader groups).
+---
+ editor/export/shader_baker_export_plugin.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/editor/export/shader_baker_export_plugin.cpp b/editor/export/shader_baker_export_plugin.cpp
+index 0f51b22c17..c9505883aa 100644
+--- a/editor/export/shader_baker_export_plugin.cpp
++++ b/editor/export/shader_baker_export_plugin.cpp
+@@ -118,6 +118,13 @@ bool ShaderBakerExportPlugin::_begin_customize_resources(const Ref<EditorExportP
+ 	to_hash.append(GODOT_VERSION_HASH);
+ 	to_hash.append("[Renderer]");
+ 	to_hash.append(shader_cache_renderer_name);
++	// Baked shaders are platform- and driver-specific: without these, a second baked preset in the same project
++	// (e.g. Windows after Linux) reuses the first preset's customized resources from the export file cache and
++	// never sends its materials to the baker.
++	to_hash.append("[Platform]");
++	to_hash.append(shader_cache_platform_name);
++	to_hash.append("[Driver]");
++	to_hash.append(shader_container_driver);
+ 	customization_configuration_hash = to_hash.as_string().hash64();
+ 
+ 	BitField<RenderingShaderLibrary::FeatureBits> renderer_features = {};
+-- 
+2.43.0
+

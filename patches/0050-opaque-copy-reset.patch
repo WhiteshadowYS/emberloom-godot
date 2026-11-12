@@ -1,0 +1,442 @@
+From 1174bc2a31504e0992febafd5c5d9a10e6fc4b14 Mon Sep 17 00:00:00 2001
+From: emberloom-godot <emberloom-godot@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:34:28 +0200
+Subject: [PATCH 6/7] Add opaque-only colour copy and a real reset_accumulation
+ signal
+
+ViewportUpscaler.requires_opaque_color copies the colour buffer after the opaque
+pass into render_buffers/color_opaque for reactive-mask generation.
+RenderingServer.viewport_reset_accumulation() and render-buffer reconfiguration
+now reset temporal history for one frame; FSR 2 and MetalFX temporal consume it
+instead of the hard-coded false.
+---
+ doc/classes/RenderSceneBuffersRD.xml          |  6 ++++
+ doc/classes/RenderingServer.xml               | 15 ++++++++++
+ doc/classes/ViewportUpscaler.xml              |  3 ++
+ scene/resources/viewport_upscaler.cpp         | 17 +++++++++++
+ scene/resources/viewport_upscaler.h           |  4 +++
+ .../render_forward_clustered.cpp              | 28 +++++++++++++++--
+ .../storage_rd/render_scene_buffers_rd.cpp    | 11 +++++++
+ .../storage_rd/render_scene_buffers_rd.h      |  5 ++++
+ servers/rendering/renderer_viewport.cpp       | 30 +++++++++++++++++++
+ servers/rendering/renderer_viewport.h         |  5 ++++
+ servers/rendering/rendering_server.cpp        |  2 ++
+ servers/rendering/rendering_server.h          |  2 ++
+ servers/rendering/rendering_server_default.h  |  2 ++
+ .../rendering/storage/render_scene_buffers.h  |  3 ++
+ 14 files changed, 131 insertions(+), 2 deletions(-)
+
+diff --git a/doc/classes/RenderSceneBuffersRD.xml b/doc/classes/RenderSceneBuffersRD.xml
+index 67ec62a168..9b4802c8fa 100644
+--- a/doc/classes/RenderSceneBuffersRD.xml
++++ b/doc/classes/RenderSceneBuffersRD.xml
+@@ -114,6 +114,12 @@
+ 				Returns the render target associated with this buffers object.
+ 			</description>
+ 		</method>
++		<method name="get_reset_accumulation" qualifiers="const">
++			<return type="bool" />
++			<description>
++				Returns [code]true[/code] if the temporal upscaler must discard its history this frame: the buffers were just (re)configured or [method RenderingServer.viewport_reset_accumulation] was called.
++			</description>
++		</method>
+ 		<method name="get_scaling_3d_custom_upscaler" qualifiers="const">
+ 			<return type="RID" />
+ 			<description>
+diff --git a/doc/classes/RenderingServer.xml b/doc/classes/RenderingServer.xml
+index 9ff899402a..5f27e24fc7 100644
+--- a/doc/classes/RenderingServer.xml
++++ b/doc/classes/RenderingServer.xml
+@@ -4163,6 +4163,13 @@
+ 				Detaches a viewport from a canvas.
+ 			</description>
+ 		</method>
++		<method name="viewport_reset_accumulation">
++			<return type="void" />
++			<param index="0" name="viewport" type="RID" />
++			<description>
++				Asks the temporal upscaler of [param viewport] (FSR 2, MetalFX temporal or a [ViewportUpscaler]) to discard its history on the next rendered frame. Call it on camera cuts and teleports. Render buffers also request a reset whenever they are reconfigured.
++			</description>
++		</method>
+ 		<method name="viewport_set_active">
+ 			<return type="void" />
+ 			<param index="0" name="viewport" type="RID" />
+@@ -4562,6 +4569,14 @@
+ 				If set to [code]true[/code], this upscaler requires motion vectors to be produced.
+ 			</description>
+ 		</method>
++		<method name="viewport_upscaler_set_requires_opaque_color">
++			<return type="void" />
++			<param index="0" name="viewport_upscaler" type="RID" />
++			<param index="1" name="requires_opaque_color" type="bool" />
++			<description>
++				If [code]true[/code], viewports using this upscaler get an opaque-only colour copy. See [member ViewportUpscaler.requires_opaque_color].
++			</description>
++		</method>
+ 		<method name="visibility_notifier_create">
+ 			<return type="RID" />
+ 			<description>
+diff --git a/doc/classes/ViewportUpscaler.xml b/doc/classes/ViewportUpscaler.xml
+index 739f5d4134..967ed7e754 100644
+--- a/doc/classes/ViewportUpscaler.xml
++++ b/doc/classes/ViewportUpscaler.xml
+@@ -27,5 +27,8 @@
+ 		<member name="requires_motion_vectors" type="bool" setter="set_requires_motion_vectors" getter="get_requires_motion_vectors" default="false">
+ 			If [code]true[/code] this upscaler requires motion vectors. Set it before assigning the upscaler to a viewport.
+ 		</member>
++		<member name="requires_opaque_color" type="bool" setter="set_requires_opaque_color" getter="get_requires_opaque_color" default="false">
++			If [code]true[/code], the renderer copies the colour buffer after the opaque pass (before transparent objects are drawn) into the [code]render_buffers[/code] / [code]color_opaque[/code] texture at the internal size; read it with [method RenderSceneBuffersRD.get_texture_slice]. Upscalers use it to generate reactive and transparency-and-composition masks. Costs one full-screen copy per frame.
++		</member>
+ 	</members>
+ </class>
+diff --git a/scene/resources/viewport_upscaler.cpp b/scene/resources/viewport_upscaler.cpp
+index d1c22ef45b..b10afa55b3 100644
+--- a/scene/resources/viewport_upscaler.cpp
++++ b/scene/resources/viewport_upscaler.cpp
+@@ -47,6 +47,10 @@ void ViewportUpscaler::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("get_jitter_phase_count"), &ViewportUpscaler::get_jitter_phase_count);
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "jitter_phase_count", PROPERTY_HINT_RANGE, "0,256,1"), "set_jitter_phase_count", "get_jitter_phase_count");
+ 
++	ClassDB::bind_method(D_METHOD("set_requires_opaque_color", "enabled"), &ViewportUpscaler::set_requires_opaque_color);
++	ClassDB::bind_method(D_METHOD("get_requires_opaque_color"), &ViewportUpscaler::get_requires_opaque_color);
++	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "requires_opaque_color"), "set_requires_opaque_color", "get_requires_opaque_color");
++
+ 	GDVIRTUAL_BIND(_render_callback, "render_data");
+ }
+ 
+@@ -93,6 +97,19 @@ uint32_t ViewportUpscaler::get_jitter_phase_count() const {
+ 	return jitter_phase_count;
+ }
+ 
++void ViewportUpscaler::set_requires_opaque_color(bool p_enabled) {
++	requires_opaque_color = p_enabled;
++	if (rid.is_valid()) {
++		RenderingServer *rs = RenderingServer::get_singleton();
++		ERR_FAIL_NULL(rs);
++		rs->viewport_upscaler_set_requires_opaque_color(rid, requires_opaque_color);
++	}
++}
++
++bool ViewportUpscaler::get_requires_opaque_color() const {
++	return requires_opaque_color;
++}
++
+ ViewportUpscaler::ViewportUpscaler() {
+ 	RenderingServer *rs = RenderingServer::get_singleton();
+ 	if (rs != nullptr) {
+diff --git a/scene/resources/viewport_upscaler.h b/scene/resources/viewport_upscaler.h
+index abc01673ca..1eca471104 100644
+--- a/scene/resources/viewport_upscaler.h
++++ b/scene/resources/viewport_upscaler.h
+@@ -42,6 +42,7 @@ private:
+ 	bool requires_motion_vectors = false;
+ 	float mipmap_bias = 0.0;
+ 	uint32_t jitter_phase_count = 0;
++	bool requires_opaque_color = false;
+ 
+ protected:
+ 	static void _bind_methods();
+@@ -61,6 +62,9 @@ public:
+ 	void set_jitter_phase_count(uint32_t p_jitter_phase_count);
+ 	uint32_t get_jitter_phase_count() const;
+ 
++	void set_requires_opaque_color(bool p_enabled);
++	bool get_requires_opaque_color() const;
++
+ 	ViewportUpscaler();
+ 	~ViewportUpscaler();
+ };
+diff --git a/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp b/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp
+index 3b6575511e..f3f075e67d 100644
+--- a/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp
++++ b/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp
+@@ -2417,6 +2417,30 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
+ 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data);
+ 	}
+ 
++	if (rb_data.is_valid() && scale_type == SCALE_CUSTOM && rb->has_internal_texture() && RSG::viewport->viewport_upscaler_get_requires_opaque_color(custom_upscaler)) {
++		// Opaque-only colour for the custom upscaler (auto-reactive / transparency-and-composition masks):
++		// a copy of the colour buffer after the opaque pass, sky and pre-transparent effects, before transparents.
++		RENDER_TIMESTAMP("Copy Opaque Color");
++		RD::get_singleton()->draw_command_begin_label("Copy Opaque Color");
++
++		rb->ensure_color_opaque();
++		bool can_use_storage = _render_buffers_can_be_storage();
++		Size2i internal_size = rb->get_internal_size();
++		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
++			if (use_msaa) {
++				RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
++			}
++			RID dest = rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_COLOR_OPAQUE, v, 0);
++			if (can_use_storage) {
++				copy_effects->copy_to_rect(rb->get_internal_texture(v), dest, Rect2i(Point2i(), internal_size));
++			} else {
++				copy_effects->copy_to_fb_rect(rb->get_internal_texture(v), FramebufferCacheRD::get_singleton()->get_cache(dest), Rect2i(Point2i(), internal_size));
++			}
++		}
++
++		RD::get_singleton()->draw_command_end_label();
++	}
++
+ 	RENDER_TIMESTAMP("Render 3D Transparent Pass");
+ 
+ 	RD::get_singleton()->draw_command_begin_label("Render 3D Transparent Pass");
+@@ -2502,7 +2526,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
+ 				params.fovy = fovy;
+ 				params.jitter = jitter;
+ 				params.delta_time = float(time_step);
+-				params.reset_accumulation = false; // FIXME: The engine does not provide a way to reset the accumulation.
++				params.reset_accumulation = rb->get_reset_accumulation(); // Set on reconfigure and by RenderingServer.viewport_reset_accumulation().
+ 
+ 				Projection correction;
+ 				correction.set_depth_correction(true, true, false);
+@@ -2539,7 +2563,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
+ 				params.exposure = exposure;
+ 				params.dst = rb->get_upscaled_layer(v);
+ 				params.jitter_offset = jitter;
+-				params.reset = reset;
++				params.reset = reset || rb->get_reset_accumulation();
+ 
+ 				mfx_temporal_effect->process(rb_data->get_mfx_temporal_context(), params);
+ 			}
+diff --git a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp
+index 8b6cfc3f92..037580a1d5 100644
+--- a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp
++++ b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp
+@@ -79,6 +79,7 @@ void RenderSceneBuffersRD::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("get_target_size"), &RenderSceneBuffersRD::get_target_size);
+ 	ClassDB::bind_method(D_METHOD("get_scaling_3d_mode"), &RenderSceneBuffersRD::get_scaling_3d_mode);
+ 	ClassDB::bind_method(D_METHOD("get_scaling_3d_custom_upscaler"), &RenderSceneBuffersRD::get_scaling_3d_custom_upscaler);
++	ClassDB::bind_method(D_METHOD("get_reset_accumulation"), &RenderSceneBuffersRD::get_reset_accumulation);
+ 	ClassDB::bind_method(D_METHOD("get_fsr_sharpness"), &RenderSceneBuffersRD::get_fsr_sharpness);
+ 	ClassDB::bind_method(D_METHOD("get_msaa_3d"), &RenderSceneBuffersRD::get_msaa_3d);
+ 	ClassDB::bind_method(D_METHOD("get_texture_samples"), &RenderSceneBuffersRD::get_texture_samples);
+@@ -189,6 +190,9 @@ void RenderSceneBuffersRD::configure(const RenderSceneBuffersConfiguration *p_co
+ 	// cleanout any old buffers we had.
+ 	cleanup();
+ 
++	// New buffers have no valid history.
++	reset_accumulation = true;
++
+ 	// Create our color buffer.
+ 	const bool resolve_target = msaa_3d != RSE::VIEWPORT_MSAA_DISABLED;
+ 	create_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR, get_base_data_format(), get_color_usage_bits(resolve_target, false, can_be_storage));
+@@ -734,6 +738,13 @@ void RenderSceneBuffersRD::ensure_upscaled() {
+ 	}
+ }
+ 
++void RenderSceneBuffersRD::ensure_color_opaque() {
++	if (!has_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_OPAQUE)) {
++		uint32_t usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | (can_be_storage ? RD::TEXTURE_USAGE_STORAGE_BIT : 0) | RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT;
++		create_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_OPAQUE, get_base_data_format(), usage_bits);
++	}
++}
++
+ // Velocity texture.
+ 
+ void RenderSceneBuffersRD::ensure_velocity() {
+diff --git a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h
+index 2eb4967626..7c95a0ec27 100644
+--- a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h
++++ b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h
+@@ -48,6 +48,7 @@
+ #define RB_TEX_COLOR SNAME("color")
+ #define RB_TEX_COLOR_MSAA SNAME("color_msaa")
+ #define RB_TEX_COLOR_UPSCALED SNAME("color_upscaled")
++#define RB_TEX_COLOR_OPAQUE SNAME("color_opaque")
+ #define RB_TEX_COLOR_SUBSAMPLED SNAME("color_subsampled")
+ #define RB_TEX_COLOR_MSAA_SUBSAMPLED SNAME("color_msaa_subsampled")
+ #define RB_TEX_DEPTH SNAME("depth")
+@@ -84,6 +85,7 @@ private:
+ 	Size2i internal_size = Size2i(0, 0);
+ 	RSE::ViewportScaling3DMode scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_OFF;
+ 	RID scaling_3d_custom_upscaler;
++	bool reset_accumulation = true;
+ 	float fsr_sharpness = 0.2f;
+ 	float texture_mipmap_bias = 0.0f;
+ 	RSE::ViewportAnisotropicFiltering anisotropic_filtering_level = RSE::VIEWPORT_ANISOTROPY_4X;
+@@ -241,6 +243,8 @@ public:
+ 	_FORCE_INLINE_ Size2i get_target_size() const { return target_size; }
+ 	_FORCE_INLINE_ RSE::ViewportScaling3DMode get_scaling_3d_mode() const { return scaling_3d_mode; }
+ 	_FORCE_INLINE_ RID get_scaling_3d_custom_upscaler() const { return scaling_3d_custom_upscaler; }
++	virtual void set_reset_accumulation(bool p_reset) override { reset_accumulation = p_reset; }
++	_FORCE_INLINE_ bool get_reset_accumulation() const { return reset_accumulation; }
+ 	_FORCE_INLINE_ float get_fsr_sharpness() const { return fsr_sharpness; }
+ 	_FORCE_INLINE_ RSE::ViewportMSAA get_msaa_3d() const { return msaa_3d; }
+ 	_FORCE_INLINE_ RD::TextureSamples get_texture_samples() const { return texture_samples; }
+@@ -307,6 +311,7 @@ public:
+ 
+ 	// Upscaled.
+ 	void ensure_upscaled();
++	void ensure_color_opaque();
+ 
+ 	_FORCE_INLINE_ bool has_upscaled_texture() const {
+ 		return has_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED);
+diff --git a/servers/rendering/renderer_viewport.cpp b/servers/rendering/renderer_viewport.cpp
+index 0ec8478c03..6040774219 100644
+--- a/servers/rendering/renderer_viewport.cpp
++++ b/servers/rendering/renderer_viewport.cpp
+@@ -333,7 +333,15 @@ void RendererViewport::_draw_3d(Viewport *p_viewport) {
+ 	}
+ 
+ 	float screen_mesh_lod_threshold = p_viewport->mesh_lod_threshold / float(p_viewport->size.width);
++	if (p_viewport->reset_accumulation && p_viewport->render_buffers.is_valid()) {
++		p_viewport->render_buffers->set_reset_accumulation(true);
++	}
++	p_viewport->reset_accumulation = false;
+ 	RSG::scene->render_camera(p_viewport->render_buffers, p_viewport->camera, p_viewport->scenario, p_viewport->self, p_viewport->internal_size, p_viewport->jitter_phase_count, screen_mesh_lod_threshold, p_viewport->shadow_atlas, xr_interface, p_viewport->window_output_max_value, &p_viewport->render_info);
++	if (p_viewport->render_buffers.is_valid()) {
++		// One frame only: the request (or the reconfigure that set it) has been seen by the upscaler.
++		p_viewport->render_buffers->set_reset_accumulation(false);
++	}
+ 
+ 	RENDER_TIMESTAMP("< Render 3D Scene");
+ #endif // _3D_DISABLED
+@@ -1052,6 +1060,20 @@ uint32_t RendererViewport::viewport_upscaler_get_jitter_phase_count(RID p_viewpo
+ 	return viewport_upscaler->jitter_phase_count;
+ }
+ 
++void RendererViewport::viewport_upscaler_set_requires_opaque_color(RID p_viewport_upscaler, bool p_requires_opaque_color) {
++	ViewportUpscaler *viewport_upscaler = viewport_upscaler_owner.get_or_null(p_viewport_upscaler);
++	ERR_FAIL_NULL(viewport_upscaler);
++
++	viewport_upscaler->requires_opaque_color = p_requires_opaque_color;
++}
++
++bool RendererViewport::viewport_upscaler_get_requires_opaque_color(RID p_viewport_upscaler) const {
++	ViewportUpscaler *viewport_upscaler = viewport_upscaler_owner.get_or_null(p_viewport_upscaler);
++	ERR_FAIL_NULL_V(viewport_upscaler, false);
++
++	return viewport_upscaler->requires_opaque_color;
++}
++
+ RID RendererViewport::viewport_allocate() {
+ 	return viewport_owner.allocate_rid();
+ }
+@@ -1183,6 +1205,14 @@ void RendererViewport::viewport_set_scaling_3d_custom_upscaler(RID p_viewport, R
+ 	_configure_3d_render_buffers(viewport);
+ }
+ 
++void RendererViewport::viewport_reset_accumulation(RID p_viewport) {
++	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
++	ERR_FAIL_NULL(viewport);
++
++	// Consumed by the next 3D draw of this viewport (temporal upscalers drop their history for one frame).
++	viewport->reset_accumulation = true;
++}
++
+ void RendererViewport::viewport_set_size(RID p_viewport, int p_width, int p_height, int p_view_count) {
+ 	ERR_FAIL_COND(p_width < 0 || p_height < 0 || p_view_count < 0);
+ 
+diff --git a/servers/rendering/renderer_viewport.h b/servers/rendering/renderer_viewport.h
+index 550c399570..00b5ab4a9a 100644
+--- a/servers/rendering/renderer_viewport.h
++++ b/servers/rendering/renderer_viewport.h
+@@ -47,6 +47,7 @@ public:
+ 		bool requires_motion_vectors = false;
+ 		float mipmap_bias = 0.0;
+ 		uint32_t jitter_phase_count = 0;
++		bool requires_opaque_color = false;
+ 	};
+ 
+ 	mutable RID_Owner<ViewportUpscaler, true> viewport_upscaler_owner;
+@@ -67,6 +68,7 @@ public:
+ 		RSE::ViewportScaling3DMode scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_BILINEAR;
+ 		float scaling_3d_scale = 1.0;
+ 		RID scaling_3d_custom_upscaler;
++		bool reset_accumulation = false;
+ 		float fsr_sharpness = 0.2f;
+ 		float texture_mipmap_bias = 0.0f;
+ 		RSE::ViewportAnisotropicFiltering anisotropic_filtering_level = RSE::VIEWPORT_ANISOTROPY_4X;
+@@ -239,6 +241,8 @@ public:
+ 	float viewport_upscaler_get_mipmap_bias(RID p_viewport_upscaler) const;
+ 	void viewport_upscaler_set_jitter_phase_count(RID p_viewport_upscaler, uint32_t p_jitter_phase_count);
+ 	uint32_t viewport_upscaler_get_jitter_phase_count(RID p_viewport_upscaler) const;
++	void viewport_upscaler_set_requires_opaque_color(RID p_viewport_upscaler, bool p_requires_opaque_color);
++	bool viewport_upscaler_get_requires_opaque_color(RID p_viewport_upscaler) const;
+ 
+ 	RID viewport_allocate();
+ 	void viewport_initialize(RID p_rid);
+@@ -258,6 +262,7 @@ public:
+ 	void viewport_set_scaling_3d_mode(RID p_viewport, RSE::ViewportScaling3DMode p_mode);
+ 	void viewport_set_scaling_3d_scale(RID p_viewport, float p_scaling_3d_scale);
+ 	void viewport_set_scaling_3d_custom_upscaler(RID p_viewport, RID p_viewport_upscaler);
++	void viewport_reset_accumulation(RID p_viewport);
+ 	void viewport_set_fsr_sharpness(RID p_viewport, float p_sharpness);
+ 	void viewport_set_texture_mipmap_bias(RID p_viewport, float p_mipmap_bias);
+ 	void viewport_set_anisotropic_filtering_level(RID p_viewport, RSE::ViewportAnisotropicFiltering p_anisotropic_filtering_level);
+diff --git a/servers/rendering/rendering_server.cpp b/servers/rendering/rendering_server.cpp
+index 0f9462f3db..71cc358d2c 100644
+--- a/servers/rendering/rendering_server.cpp
++++ b/servers/rendering/rendering_server.cpp
+@@ -2854,6 +2854,7 @@ void RenderingServer::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("viewport_upscaler_set_requires_motion_vectors", "viewport_upscaler", "requires_motion_vectors"), &RenderingServer::viewport_upscaler_set_requires_motion_vectors);
+ 	ClassDB::bind_method(D_METHOD("viewport_upscaler_set_mipmap_bias", "viewport_upscaler", "mipmap_bias"), &RenderingServer::viewport_upscaler_set_mipmap_bias);
+ 	ClassDB::bind_method(D_METHOD("viewport_upscaler_set_jitter_phase_count", "viewport_upscaler", "jitter_phase_count"), &RenderingServer::viewport_upscaler_set_jitter_phase_count);
++	ClassDB::bind_method(D_METHOD("viewport_upscaler_set_requires_opaque_color", "viewport_upscaler", "requires_opaque_color"), &RenderingServer::viewport_upscaler_set_requires_opaque_color);
+ 
+ 	/* VIEWPORT */
+ 
+@@ -2871,6 +2872,7 @@ void RenderingServer::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_mode", "viewport", "scaling_3d_mode"), &RenderingServer::viewport_set_scaling_3d_mode);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_scale", "viewport", "scale"), &RenderingServer::viewport_set_scaling_3d_scale);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_custom_upscaler", "viewport", "upscaler"), &RenderingServer::viewport_set_scaling_3d_custom_upscaler);
++	ClassDB::bind_method(D_METHOD("viewport_reset_accumulation", "viewport"), &RenderingServer::viewport_reset_accumulation);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_fsr_sharpness", "viewport", "sharpness"), &RenderingServer::viewport_set_fsr_sharpness);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_texture_mipmap_bias", "viewport", "mipmap_bias"), &RenderingServer::viewport_set_texture_mipmap_bias);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_anisotropic_filtering_level", "viewport", "anisotropic_filtering_level"), &RenderingServer::viewport_set_anisotropic_filtering_level);
+diff --git a/servers/rendering/rendering_server.h b/servers/rendering/rendering_server.h
+index 3b2fc5cf20..3cfd9bfe9d 100644
+--- a/servers/rendering/rendering_server.h
++++ b/servers/rendering/rendering_server.h
+@@ -539,6 +539,7 @@ public:
+ 	virtual void viewport_upscaler_set_requires_motion_vectors(RID p_viewport_upscaler, bool p_requires_motion_vectors) = 0;
+ 	virtual void viewport_upscaler_set_mipmap_bias(RID p_viewport_upscaler, float p_mipmap_bias) = 0;
+ 	virtual void viewport_upscaler_set_jitter_phase_count(RID p_viewport_upscaler, uint32_t p_jitter_phase_count) = 0;
++	virtual void viewport_upscaler_set_requires_opaque_color(RID p_viewport_upscaler, bool p_requires_opaque_color) = 0;
+ 
+ 	/* VIEWPORT API */
+ 
+@@ -559,6 +560,7 @@ public:
+ 	virtual void viewport_set_scaling_3d_mode(RID p_viewport, RSE::ViewportScaling3DMode p_scaling_3d_mode) = 0;
+ 	virtual void viewport_set_scaling_3d_scale(RID p_viewport, float p_scaling_3d_scale) = 0;
+ 	virtual void viewport_set_scaling_3d_custom_upscaler(RID p_viewport, RID p_viewport_upscaler) = 0;
++	virtual void viewport_reset_accumulation(RID p_viewport) = 0;
+ 	virtual void viewport_set_fsr_sharpness(RID p_viewport, float p_fsr_sharpness) = 0;
+ 	virtual void viewport_set_texture_mipmap_bias(RID p_viewport, float p_texture_mipmap_bias) = 0;
+ 	virtual void viewport_set_anisotropic_filtering_level(RID p_viewport, RSE::ViewportAnisotropicFiltering p_anisotropic_filtering_level) = 0;
+diff --git a/servers/rendering/rendering_server_default.h b/servers/rendering/rendering_server_default.h
+index c6e7e2d876..3d94d6ee05 100644
+--- a/servers/rendering/rendering_server_default.h
++++ b/servers/rendering/rendering_server_default.h
+@@ -736,6 +736,7 @@ public:
+ 	FUNC2(viewport_upscaler_set_requires_motion_vectors, RID, bool)
+ 	FUNC2(viewport_upscaler_set_mipmap_bias, RID, float)
+ 	FUNC2(viewport_upscaler_set_jitter_phase_count, RID, uint32_t)
++	FUNC2(viewport_upscaler_set_requires_opaque_color, RID, bool)
+ 
+ 	/* VIEWPORT TARGET API */
+ 
+@@ -758,6 +759,7 @@ public:
+ 	FUNC2(viewport_set_scaling_3d_mode, RID, RSE::ViewportScaling3DMode)
+ 	FUNC2(viewport_set_scaling_3d_scale, RID, float)
+ 	FUNC2(viewport_set_scaling_3d_custom_upscaler, RID, RID)
++	FUNC1(viewport_reset_accumulation, RID)
+ 	FUNC2(viewport_set_fsr_sharpness, RID, float)
+ 	FUNC2(viewport_set_texture_mipmap_bias, RID, float)
+ 	FUNC2(viewport_set_anisotropic_filtering_level, RID, RSE::ViewportAnisotropicFiltering)
+diff --git a/servers/rendering/storage/render_scene_buffers.h b/servers/rendering/storage/render_scene_buffers.h
+index 7bb65cbbf2..89960757c1 100644
+--- a/servers/rendering/storage/render_scene_buffers.h
++++ b/servers/rendering/storage/render_scene_buffers.h
+@@ -118,4 +118,7 @@ public:
+ 	virtual void set_texture_mipmap_bias(float p_texture_mipmap_bias) = 0;
+ 	virtual void set_anisotropic_filtering_level(RSE::ViewportAnisotropicFiltering p_anisotropic_filtering_level) = 0;
+ 	virtual void set_use_debanding(bool p_use_debanding) = 0;
++
++	// Temporal history reset for one frame (emberloom-godot P5). Not pure so RenderSceneBuffersExtension keeps compiling.
++	virtual void set_reset_accumulation(bool p_reset) {}
+ };
+-- 
+2.43.0
+
