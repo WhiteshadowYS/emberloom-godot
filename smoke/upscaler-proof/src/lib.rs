@@ -36,8 +36,11 @@ void main() {
 #[class(base = ViewportUpscaler, init, tool)]
 pub struct PassthroughUpscaler {
     base: Base<ViewportUpscaler>,
+    #[init(val = Rid::Invalid)]
     shader: Rid,
+    #[init(val = Rid::Invalid)]
     pipeline: Rid,
+    #[init(val = Rid::Invalid)]
     sampler: Rid,
     failed: bool,
     /// Frames upscaled (read by the proof script / log).
@@ -93,7 +96,7 @@ impl IViewportUpscaler for PassthroughUpscaler {
     fn render_callback(&mut self, render_data: Option<Gd<RenderData>>) {
         let Some(render_data) = render_data else { return };
         let Some(buffers) = render_data.get_render_scene_buffers() else { return };
-        let Ok(mut buffers) = buffers.try_cast::<RenderSceneBuffersRd>() else { return };
+        let Ok(buffers) = buffers.try_cast::<RenderSceneBuffersRd>() else { return };
         let Some(mut rd) = RenderingServer::singleton().get_rendering_device() else { return };
         if !self.ensure_pipeline(&mut rd) {
             return;
