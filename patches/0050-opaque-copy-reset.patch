@@ -1,4 +1,4 @@
-From 1174bc2a31504e0992febafd5c5d9a10e6fc4b14 Mon Sep 17 00:00:00 2001
+From 20d5df4d878d8d86ad7dc79b084d037702b31f44 Mon Sep 17 00:00:00 2001
 From: emberloom-godot <emberloom-godot@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 00:34:28 +0200
 Subject: [PATCH 6/7] Add opaque-only colour copy and a real reset_accumulation

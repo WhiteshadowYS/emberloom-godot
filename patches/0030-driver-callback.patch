@@ -1,4 +1,4 @@
-From 3e5ef93702e44b3f5e897800caa1d8c7a41f9a15 Mon Sep 17 00:00:00 2001
+From 915a4ef5f42b8353fd86b9f06a623ce9ede070b6 Mon Sep 17 00:00:00 2001
 From: emberloom-godot <emberloom-godot@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 00:36:11 +0200
 Subject: [PATCH 4/7] Bind RenderingDevice.driver_callback_add for native SDK
@@ -6,18 +6,17 @@ Subject: [PATCH 4/7] Bind RenderingDevice.driver_callback_add for native SDK
 
 Expose the render-graph driver callback (the MetalFX mechanism) to scripts and
 GDExtensions: a Callable receives the native command buffer, plus the
-DRIVER_RESOURCE_COMMAND_BUFFER handle on Vulkan and D3D12.
+DRIVER_RESOURCE_COMMAND_BUFFER handle (Vulkan only for now).
 ---
  doc/classes/RenderingDevice.xml               | 91 +++++++++++++++++++
- .../d3d12/rendering_device_driver_d3d12.cpp   |  4 +
  .../vulkan/rendering_device_driver_vulkan.cpp |  4 +
- servers/rendering/rendering_device.cpp        | 61 +++++++++++++
+ servers/rendering/rendering_device.cpp        | 68 ++++++++++++++
  servers/rendering/rendering_device.h          |  8 ++
  servers/rendering/rendering_device_commons.h  |  1 +
- 6 files changed, 169 insertions(+)
+ 5 files changed, 172 insertions(+)
 
 diff --git a/doc/classes/RenderingDevice.xml b/doc/classes/RenderingDevice.xml
-index 8fc95b270c..5d09f1a66e 100644
+index 8fc95b270c..ef6c038e4c 100644
 --- a/doc/classes/RenderingDevice.xml
 +++ b/doc/classes/RenderingDevice.xml
 @@ -436,6 +436,16 @@
@@ -31,7 +30,7 @@ index 8fc95b270c..5d09f1a66e 100644
 +			<param index="2" name="resource_types" type="PackedInt32Array" />
 +			<param index="3" name="resource_usages" type="PackedInt32Array" />
 +			<description>
-+				Records a call to [param callback] into the render graph at the current position. When the graph is recorded into the native command buffer, [param callback] is called once with that command buffer's native handle (see [constant DRIVER_RESOURCE_COMMAND_BUFFER]) so native SDKs (DLSS, FidelityFX, XeSS) can record their own commands into the frame. [param resources] lists the textures / buffers the callback touches, with one [enum CallbackResourceType] and one [enum CallbackResourceUsage] each; the graph transitions them before the call. The callback runs on the rendering thread during submission and must not call [RenderingDevice] methods. Must be called on the rendering thread outside of draw, compute and raytracing lists.
++				Records a call to [param callback] into the render graph at the current position. When the graph is recorded into the native command buffer, [param callback] is called once with that command buffer's native handle (see [constant DRIVER_RESOURCE_COMMAND_BUFFER]) so native SDKs (DLSS, FidelityFX, XeSS) can record their own commands into the frame. [param resources] lists the textures / buffers the callback touches, with one [enum CallbackResourceType] and one [enum CallbackResourceUsage] each; the graph transitions them before the call, and the call is ordered only against these declared resources (with render-graph reordering an undeclared dependency may run out of order). Vulkan only: other drivers return [constant ERR_UNAVAILABLE]. The callback runs on the rendering thread during submission and must not call [RenderingDevice] methods. Must be called on the rendering thread outside of draw, compute and raytracing lists.
 +			</description>
 +		</method>
  		<method name="framebuffer_create">
@@ -42,7 +41,7 @@ index 8fc95b270c..5d09f1a66e 100644
  			- Metal: [code]MTLRenderPipelineState[/code].
  		</constant>
 +		<constant name="DRIVER_RESOURCE_COMMAND_BUFFER" value="13" enum="DriverResource">
-+			Native command buffer ([code]VkCommandBuffer[/code] / [code]ID3D12GraphicsCommandList[/code]). Only meaningful inside a callback registered with [method driver_callback_add], which receives it as its argument; [method get_driver_resource] returns [code]0[/code] for it.
++			Native command buffer ([code]VkCommandBuffer[/code]; Vulkan only). Only meaningful inside a callback registered with [method driver_callback_add], which receives it as its argument; [method get_driver_resource] returns [code]0[/code] for it.
 +		</constant>
  		<constant name="DRIVER_RESOURCE_VULKAN_DEVICE" value="0" enum="DriverResource" deprecated="Use [constant DRIVER_RESOURCE_LOGICAL_DEVICE] instead.">
  		</constant>
@@ -131,21 +130,6 @@ index 8fc95b270c..5d09f1a66e 100644
 +		</constant>
  	</constants>
  </class>
-diff --git a/drivers/d3d12/rendering_device_driver_d3d12.cpp b/drivers/d3d12/rendering_device_driver_d3d12.cpp
-index 5afb1b7aa0..a4465e2a2a 100644
---- a/drivers/d3d12/rendering_device_driver_d3d12.cpp
-+++ b/drivers/d3d12/rendering_device_driver_d3d12.cpp
-@@ -5776,6 +5776,10 @@ uint64_t RenderingDeviceDriverD3D12::get_resource_native_handle(DriverResource p
- 		case DRIVER_RESOURCE_RENDER_PIPELINE: {
- 			return p_driver_id.id;
- 		}
-+		case DRIVER_RESOURCE_COMMAND_BUFFER: {
-+			const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_driver_id.id;
-+			return command_buffer != nullptr ? (uint64_t)command_buffer->cmd_list.Get() : 0;
-+		}
- 		default: {
- 			return 0;
- 		}
 diff --git a/drivers/vulkan/rendering_device_driver_vulkan.cpp b/drivers/vulkan/rendering_device_driver_vulkan.cpp
 index 4b1bd9fd0e..313c78fab7 100644
 --- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
@@ -162,10 +146,10 @@ index 4b1bd9fd0e..313c78fab7 100644
  			return 0;
  		}
 diff --git a/servers/rendering/rendering_device.cpp b/servers/rendering/rendering_device.cpp
-index 7574038788..37dfa6e643 100644
+index 7574038788..1eab426e8d 100644
 --- a/servers/rendering/rendering_device.cpp
 +++ b/servers/rendering/rendering_device.cpp
-@@ -1235,6 +1235,37 @@ Error RenderingDevice::driver_callback_add(RDD::DriverCallback p_callback, void
+@@ -1235,6 +1235,40 @@ Error RenderingDevice::driver_callback_add(RDD::DriverCallback p_callback, void
  	return OK;
  }
  
@@ -179,6 +163,9 @@ index 7574038788..37dfa6e643 100644
 +
 +Error RenderingDevice::_driver_callback_add_bind(const Callable &p_callback, const TypedArray<RID> &p_resources, const Vector<int32_t> &p_resource_types, const Vector<int32_t> &p_resource_usages) {
 +	ERR_FAIL_COND_V(!p_callback.is_valid(), ERR_INVALID_PARAMETER);
++	// Vulkan only: the D3D12 driver caches bound PSO / root signature / descriptor heaps on the command buffer
++	// (a native SDK would invalidate them behind its back) and skips graph barriers without enhanced barriers.
++	ERR_FAIL_COND_V_MSG(get_device_api_name() != "Vulkan", ERR_UNAVAILABLE, "driver_callback_add is only supported on Vulkan.");
 +	ERR_FAIL_COND_V_MSG(p_resource_types.size() != p_resources.size() || p_resource_usages.size() != p_resources.size(), ERR_INVALID_PARAMETER,
 +			"resources, resource_types and resource_usages must have the same size.");
 +
@@ -203,7 +190,18 @@ index 7574038788..37dfa6e643 100644
  String RenderingDevice::get_perf_report() const {
  	String perf_report_text;
  	perf_report_text += " gpu:" + String::num_int64(gpu_copy_count);
-@@ -9224,6 +9255,7 @@ void RenderingDevice::_bind_methods() {
+@@ -8775,6 +8809,10 @@ uint64_t RenderingDevice::get_driver_resource(DriverResource p_resource, RID p_r
+ 
+ 			driver_id = render_pipeline->driver_id.id;
+ 		} break;
++		case DRIVER_RESOURCE_COMMAND_BUFFER: {
++			// Only meaningful inside a driver_callback_add() callback, which receives it as its argument.
++			return 0;
++		}
+ 		default: {
+ 			ERR_FAIL_V(0);
+ 		} break;
+@@ -9224,6 +9262,7 @@ void RenderingDevice::_bind_methods() {
  	ClassDB::bind_method(D_METHOD("get_memory_usage", "type"), &RenderingDevice::get_memory_usage);
  
  	ClassDB::bind_method(D_METHOD("get_driver_resource", "resource", "rid", "index"), &RenderingDevice::get_driver_resource);
@@ -211,7 +209,7 @@ index 7574038788..37dfa6e643 100644
  
  	ClassDB::bind_method(D_METHOD("get_perf_report"), &RenderingDevice::get_perf_report);
  
-@@ -9259,6 +9291,35 @@ void RenderingDevice::_bind_methods() {
+@@ -9259,6 +9298,35 @@ void RenderingDevice::_bind_methods() {
  	BIND_ENUM_CONSTANT(DRIVER_RESOURCE_BUFFER);
  	BIND_ENUM_CONSTANT(DRIVER_RESOURCE_COMPUTE_PIPELINE);
  	BIND_ENUM_CONSTANT(DRIVER_RESOURCE_RENDER_PIPELINE);
@@ -248,7 +246,7 @@ index 7574038788..37dfa6e643 100644
  	BIND_ENUM_CONSTANT(DRIVER_RESOURCE_VULKAN_DEVICE);
  	BIND_ENUM_CONSTANT(DRIVER_RESOURCE_VULKAN_PHYSICAL_DEVICE);
 diff --git a/servers/rendering/rendering_device.h b/servers/rendering/rendering_device.h
-index 38c4b14cdb..ae82da03ee 100644
+index 38c4b14cdb..70a9daab10 100644
 --- a/servers/rendering/rendering_device.h
 +++ b/servers/rendering/rendering_device.h
 @@ -317,6 +317,12 @@ public:
@@ -264,15 +262,15 @@ index 38c4b14cdb..ae82da03ee 100644
  	/*****************/
  	/**** TEXTURE ****/
  	/*****************/
-@@ -2062,6 +2068,8 @@ VARIANT_BITFIELD_CAST(RenderingDevice::DrawFlags);
- VARIANT_BITFIELD_CAST(RenderingDevice::BarrierMask);
- VARIANT_ENUM_CAST(RenderingDevice::InitialAction)
- VARIANT_ENUM_CAST(RenderingDevice::FinalAction)
+@@ -2057,6 +2063,8 @@ VARIANT_ENUM_CAST(RenderingDevice::MemoryType)
+ VARIANT_ENUM_CAST(RenderingDevice::Features)
+ VARIANT_ENUM_CAST(RenderingDevice::BreadcrumbMarker)
+ VARIANT_BITFIELD_CAST(RenderingDevice::DrawFlags);
 +VARIANT_ENUM_CAST(RenderingDevice::CallbackResourceType)
 +VARIANT_ENUM_CAST(RenderingDevice::CallbackResourceUsage)
- #endif
  
- typedef RenderingDevice RD;
+ #ifndef DISABLE_DEPRECATED
+ VARIANT_BITFIELD_CAST(RenderingDevice::BarrierMask);
 diff --git a/servers/rendering/rendering_device_commons.h b/servers/rendering/rendering_device_commons.h
 index fd7b65b246..9cd4f760e4 100644
 --- a/servers/rendering/rendering_device_commons.h

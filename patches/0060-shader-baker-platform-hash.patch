@@ -1,4 +1,4 @@
-From 0340e9548ea6f5fd3c258adaffcf831b34bb06df Mon Sep 17 00:00:00 2001
+From 444eaae3b657818f78ab066daf0ca786f814a50f Mon Sep 17 00:00:00 2001
 From: emberloom-godot <emberloom-godot@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 00:37:00 +0200
 Subject: [PATCH 7/7] Include the export platform and driver in the shader

@@ -1,4 +1,4 @@
-From 1607f67971cca1a091e7ac82658279645c301248 Mon Sep 17 00:00:00 2001
+From d84059da3e2d8e55489d718358e943e72624e718 Mon Sep 17 00:00:00 2001
 From: Bastiaan Olij <mux213@gmail.com>
 Date: Wed, 7 Jan 2026 18:05:37 +1100
 Subject: [PATCH 1/7] Add custom upscaler implementation to RD renderer

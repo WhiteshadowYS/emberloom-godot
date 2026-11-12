@@ -1,4 +1,4 @@
-From dad6bbddfecd3f9bdac98a264fa35551d11ac1fa Mon Sep 17 00:00:00 2001
+From b41ae05ced719bd126d51e5294042cca8c366f0e Mon Sep 17 00:00:00 2001
 From: emberloom-godot <emberloom-godot@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 00:32:24 +0200
 Subject: [PATCH 2/7] Fix ViewportUpscaler property types and jitter phase

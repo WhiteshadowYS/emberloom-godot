@@ -1,4 +1,4 @@
-From 80d5965952b6629a4373ff6a37f79c0b4f03981a Mon Sep 17 00:00:00 2001
+From 594ce2acbee48e64ac151aaa2a2e8cd1d639c849 Mon Sep 17 00:00:00 2001
 From: emberloom-godot <emberloom-godot@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 00:32:46 +0200
 Subject: [PATCH 3/7] Expose temporal upscaler inputs on RenderSceneData

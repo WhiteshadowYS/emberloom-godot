@@ -1,4 +1,4 @@
-From 85721ce5b76be3a685009f6c8ac7ab3aae6f7f22 Mon Sep 17 00:00:00 2001
+From 5cb838fc04349c7ecdc394ba442ab9fd30dbb04c Mon Sep 17 00:00:00 2001
 From: emberloom-godot <emberloom-godot@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 00:36:45 +0200
 Subject: [PATCH 5/7] Add project settings for extra Vulkan instance and device
