@@ -1,5 +1,18 @@
 # Changelog
 
+## 4.7.2-el.4 — 2026-11-14
+
+- Base / flags: unchanged (`4.7.2-stable`, `ed1daf0bf`; `production=yes`; Windows MinGW-GCC).
+- Patch in: F1 `0120-swap-chain-interposer` — frame generation plumbing (build-arena GX10, FSR FG via the FidelityFX
+  SDK 2.4 Vulkan DLLs): `RenderingDevice.swap_chain_interposer_set / swap_chain_interposer_is_active /
+  frame_generation_queues_available` (native C ABI `drivers/vulkan/emberloom_swap_chain_interposer.h`: create /
+  images / acquire / present / destroy replacements + game / present / async compute / acquire queues with a
+  locked submit for Godot's queue); project setting `rendering/rendering_device/vulkan/reserve_frame_generation_queues`
+  (one spare queue per family, outside Godot's pool); `RenderingServer.viewport_set_hudless_capture /
+  viewport_get_hudless_texture` (render target copy after 3D, before 2D canvas).
+- Stock paths unchanged unless the game sets the project setting / an interposer / HUD-less capture. NV low latency
+  stays inactive on an interposed swap chain (its calls take a driver swap chain).
+
 ## 4.7.2-el.3 — 2026-11-13
 
 - Base / flags: unchanged (`4.7.2-stable`, `ed1daf0bf`; `production=yes`; Windows MinGW-GCC).
