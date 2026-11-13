@@ -1,5 +1,16 @@
 # Changelog
 
+## 4.7.2-el.2 — 2026-11-13
+
+- Base / flags: unchanged (`4.7.2-stable`, `ed1daf0bf`; `production=yes`; Windows MinGW-GCC).
+- Patch in: L1 `0100-low-latency-vulkan` — `VK_AMD_anti_lag` (AMD Windows, RADV / Mesa 26.3+) and
+  `VK_NV_low_latency2` (+ `VK_KHR_present_id`, timeline semaphore) in the Vulkan driver.
+- API additions only: `RenderingDevice.low_latency_is_supported / low_latency_set_enabled / low_latency_is_enabled /
+  low_latency_get_input_to_present_usec`. The extensions are requested by the game through P4's
+  `rendering/rendering_device/vulkan/extra_device_extensions`; nothing changes unless the game enables the mode.
+- Stock-path change: one `RenderingDevice.low_latency_frame_begin()` call per main-loop iteration (Linux/BSD,
+  Windows) — a ticks read when the mode is off.
+
 ## 4.7.2-el.1 — 2026-11-13
 
 - Base: unchanged (`4.7.2-stable`, `ed1daf0bf`). Flags: unchanged (`production=yes`; Windows MinGW-GCC).
