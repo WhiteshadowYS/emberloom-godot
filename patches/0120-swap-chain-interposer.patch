@@ -1,4 +1,4 @@
-From e0953b2d6774111b72abe5c4bde6a0dadfe3e0d5 Mon Sep 17 00:00:00 2001
+From bb1cc436c645a00ecca003df670ff9f0183ec0b0 Mon Sep 17 00:00:00 2001
 From: emberloom-godot <emberloom-godot@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 00:35:49 +0200
 Subject: [PATCH] Add a swap chain interposer, reserved frame generation queues
@@ -10,7 +10,7 @@ Subject: [PATCH] Add a swap chain interposer, reserved frame generation queues
  doc/classes/RenderingDevice.xml               |  19 ++
  doc/classes/RenderingServer.xml               |  15 ++
  .../vulkan/emberloom_swap_chain_interposer.h  |  62 +++++
- .../vulkan/rendering_device_driver_vulkan.cpp | 218 ++++++++++++++++--
+ .../vulkan/rendering_device_driver_vulkan.cpp | 223 ++++++++++++++++--
  .../vulkan/rendering_device_driver_vulkan.h   |  23 ++
  servers/rendering/renderer_viewport.cpp       |  68 ++++++
  servers/rendering/renderer_viewport.h         |   8 +
@@ -20,7 +20,7 @@ Subject: [PATCH] Add a swap chain interposer, reserved frame generation queues
  servers/rendering/rendering_server.cpp        |   2 +
  servers/rendering/rendering_server.h          |   2 +
  servers/rendering/rendering_server_default.h  |   2 +
- 15 files changed, 436 insertions(+), 16 deletions(-)
+ 15 files changed, 441 insertions(+), 16 deletions(-)
  create mode 100644 drivers/vulkan/emberloom_swap_chain_interposer.h
 
 diff --git a/core/config/project_settings.cpp b/core/config/project_settings.cpp
@@ -189,7 +189,7 @@ index 0000000000..f6d425e4e9
 +}
 +#endif
 diff --git a/drivers/vulkan/rendering_device_driver_vulkan.cpp b/drivers/vulkan/rendering_device_driver_vulkan.cpp
-index c139a1a1ff..988b18fbfa 100644
+index c139a1a1ff..8f3bd11dfa 100644
 --- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
 +++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
 @@ -1338,7 +1338,12 @@ Error RenderingDeviceDriverVulkan::_add_queue_create_info(LocalVector<VkDeviceQu
@@ -251,7 +251,7 @@ index c139a1a1ff..988b18fbfa 100644
  					if (low_latency.nv_swapchain != swapchains[0]) {
  						low_latency.nv_swapchain = swapchains[0];
  						low_latency.nv_mode_dirty = true;
-@@ -3524,16 +3546,48 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
+@@ -3524,16 +3546,53 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
  			present_info.pNext = &present_id_info;
  		}
  
@@ -284,9 +284,14 @@ index c139a1a1ff..988b18fbfa 100644
 +				single_info.swapchainCount = 1;
 +				single_info.pSwapchains = &swapchains[i];
 +				single_info.pImageIndices = &image_indices[i];
++				// `results` is reused thread_local storage: a replacement present may not write pResults.
++				results[i] = VK_SUCCESS;
 +				single_info.pResults = &results[i];
 +				const PFN_vkQueuePresentKHR queue_present = swap_chain->interposed ? swap_chain->interposed_functions.queue_present : device_functions.QueuePresentKHR;
 +				VkResult single_err = queue_present(device_queue.queue, &single_info);
++				if (single_err != VK_SUCCESS && results[i] == VK_SUCCESS) {
++					results[i] = single_err;
++				}
 +				if (single_err != VK_SUCCESS && err == VK_SUCCESS) {
 +					err = single_err;
 +				}
@@ -307,7 +312,7 @@ index c139a1a1ff..988b18fbfa 100644
  
  		device_queue.submit_mutex.unlock();
  
-@@ -3864,8 +3918,14 @@ void RenderingDeviceDriverVulkan::_swap_chain_release(SwapChain *swap_chain) {
+@@ -3864,8 +3923,14 @@ void RenderingDeviceDriverVulkan::_swap_chain_release(SwapChain *swap_chain) {
  				low_latency.nv_mode_dirty = true;
  			}
  		}
@@ -323,7 +328,7 @@ index c139a1a1ff..988b18fbfa 100644
  	}
  
  	if (swap_chain->render_pass.id != 0) {
-@@ -4080,8 +4140,42 @@ Error RenderingDeviceDriverVulkan::swap_chain_resize(CommandQueueID p_cmd_queue,
+@@ -4080,8 +4145,42 @@ Error RenderingDeviceDriverVulkan::swap_chain_resize(CommandQueueID p_cmd_queue,
  		latency_create_info.latencyModeEnable = VK_TRUE;
  		swap_create_info.pNext = &latency_create_info;
  	}
@@ -367,7 +372,7 @@ index c139a1a1ff..988b18fbfa 100644
  
  #if defined(SWAPPY_FRAME_PACING_ENABLED)
  	if (swappy_frame_pacer_enable) {
-@@ -4114,11 +4208,11 @@ Error RenderingDeviceDriverVulkan::swap_chain_resize(CommandQueueID p_cmd_queue,
+@@ -4114,11 +4213,11 @@ Error RenderingDeviceDriverVulkan::swap_chain_resize(CommandQueueID p_cmd_queue,
  #endif
  
  	uint32_t image_count = 0;
@@ -381,7 +386,7 @@ index c139a1a1ff..988b18fbfa 100644
  	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("Couldn't get Vulkan swapchain images (VkResult error %d).", err));
  
  	VkImageViewCreateInfo view_create_info = {};
-@@ -4229,7 +4323,7 @@ RDD::FramebufferID RenderingDeviceDriverVulkan::swap_chain_acquire_framebuffer(C
+@@ -4229,7 +4328,7 @@ RDD::FramebufferID RenderingDeviceDriverVulkan::swap_chain_acquire_framebuffer(C
  
  	CommandQueue *command_queue = (CommandQueue *)(p_cmd_queue.id);
  	SwapChain *swap_chain = (SwapChain *)(p_swap_chain.id);
@@ -390,7 +395,7 @@ index c139a1a1ff..988b18fbfa 100644
  		// The surface does not have a valid swap chain or it indicates it requires a resize.
  		r_resize_required = true;
  		return FramebufferID();
-@@ -4261,7 +4355,8 @@ RDD::FramebufferID RenderingDeviceDriverVulkan::swap_chain_acquire_framebuffer(C
+@@ -4261,7 +4360,8 @@ RDD::FramebufferID RenderingDeviceDriverVulkan::swap_chain_acquire_framebuffer(C
  	swap_chain->command_queues_acquired.push_back(command_queue);
  	swap_chain->command_queues_acquired_semaphores.push_back(semaphore_index);
  
@@ -400,7 +405,7 @@ index c139a1a1ff..988b18fbfa 100644
  	if (err == VK_ERROR_OUT_OF_DATE_KHR) {
  		// Out of date leaves the semaphore in a signaled state that will never finish, so it's necessary to recreate it.
  		bool semaphore_recreated = _recreate_image_semaphore(command_queue, semaphore_index, true);
-@@ -7773,6 +7868,97 @@ void RenderingDeviceDriverVulkan::_low_latency_nv_apply_mode() {
+@@ -7773,6 +7873,97 @@ void RenderingDeviceDriverVulkan::_low_latency_nv_apply_mode() {
  	low_latency.nv_mode_dirty = false;
  }
  
