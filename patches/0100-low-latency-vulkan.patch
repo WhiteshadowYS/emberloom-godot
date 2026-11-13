@@ -1,4 +1,4 @@
-From 45c1e518adb851a4377fda852b94410622cc57a2 Mon Sep 17 00:00:00 2001
+From 75a5dd4c37c42cf802f75366e89098e975d34c4f Mon Sep 17 00:00:00 2001
 From: emberloom-godot <emberloom-godot@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 13:30:20 +0200
 Subject: [PATCH 8/8] Add Vulkan low latency: VK_AMD_anti_lag and
@@ -15,18 +15,18 @@ project setting; NV needs VK_KHR_present_id and timeline semaphores. Off by
 default; unsupported devices and other drivers keep no-op defaults.
 ---
  doc/classes/RenderingDevice.xml               |  25 ++
- .../vulkan/rendering_device_driver_vulkan.cpp | 247 ++++++++++++++++++
- .../vulkan/rendering_device_driver_vulkan.h   |  30 +++
+ .../vulkan/rendering_device_driver_vulkan.cpp | 256 ++++++++++++++++++
+ .../vulkan/rendering_device_driver_vulkan.h   |  31 +++
  platform/linuxbsd/os_linuxbsd.cpp             |   5 +
  platform/windows/os_windows.cpp               |   5 +
  .../renderer_rd/renderer_compositor_rd.cpp    |   2 +
- servers/rendering/rendering_device.cpp        |  43 +++
+ servers/rendering/rendering_device.cpp        |  48 ++++
  servers/rendering/rendering_device.h          |  17 ++
  servers/rendering/rendering_device_driver.h   |  10 +
- 9 files changed, 384 insertions(+)
+ 9 files changed, 399 insertions(+)
 
 diff --git a/doc/classes/RenderingDevice.xml b/doc/classes/RenderingDevice.xml
-index ef6c038e4c..4f2b44bd2b 100644
+index ef6c038e4c..1128b3ded3 100644
 --- a/doc/classes/RenderingDevice.xml
 +++ b/doc/classes/RenderingDevice.xml
 @@ -818,6 +818,31 @@
@@ -48,7 +48,7 @@ index ef6c038e4c..4f2b44bd2b 100644
 +		<method name="low_latency_is_supported">
 +			<return type="bool" />
 +			<description>
-+				Returns [code]true[/code] if the device supports a driver low latency mode ([code]VK_AMD_anti_lag[/code] or [code]VK_NV_low_latency2[/code]). The extensions must be requested through [member ProjectSettings.rendering/rendering_device/vulkan/extra_device_extensions]; [code]VK_NV_low_latency2[/code] also needs [code]VK_KHR_present_id[/code].
++				Returns [code]true[/code] if the device supports a driver low latency mode ([code]VK_AMD_anti_lag[/code] or [code]VK_NV_low_latency2[/code]). The extensions must be requested through [member ProjectSettings.rendering/rendering_device/vulkan/extra_device_extensions]; [code]VK_NV_low_latency2[/code] also needs [code]VK_KHR_present_id[/code]. Always [code]false[/code] with the separate rendering thread model.
 +			</description>
 +		</method>
 +		<method name="low_latency_set_enabled">
@@ -62,7 +62,7 @@ index ef6c038e4c..4f2b44bd2b 100644
  			<return type="int" />
  			<description>
 diff --git a/drivers/vulkan/rendering_device_driver_vulkan.cpp b/drivers/vulkan/rendering_device_driver_vulkan.cpp
-index 63a6690e21..dd7c1d6513 100644
+index 63a6690e21..7a56e1a982 100644
 --- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
 +++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
 @@ -928,6 +928,8 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
@@ -164,12 +164,13 @@ index 63a6690e21..dd7c1d6513 100644
  		device_functions.CreateSwapchainKHR = PFN_vkCreateSwapchainKHR(functions.GetDeviceProcAddr(vk_device, "vkCreateSwapchainKHR"));
  		device_functions.DestroySwapchainKHR = PFN_vkDestroySwapchainKHR(functions.GetDeviceProcAddr(vk_device, "vkDestroySwapchainKHR"));
  		device_functions.GetSwapchainImagesKHR = PFN_vkGetSwapchainImagesKHR(functions.GetDeviceProcAddr(vk_device, "vkGetSwapchainImagesKHR"));
-@@ -3323,6 +3389,45 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
+@@ -3323,6 +3389,46 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
  		present_info.pImageIndices = image_indices.ptr();
  		present_info.pResults = results.ptr();
  
 +		// Low latency (emberloom-godot L1): the present stage of the frame whose input marker ran last.
-+		// The first swap chain (the main window) carries the frame id; the others present without one.
++		// The first swap chain of the present (the main window for a single-window game) carries the frame id;
++		// the others present without one.
 +		uint64_t low_latency_frame = 0;
 +		bool low_latency_amd = false;
 +		bool low_latency_nv = false;
@@ -210,7 +211,7 @@ index 63a6690e21..dd7c1d6513 100644
  		device_queue.submit_mutex.lock();
  #if defined(SWAPPY_FRAME_PACING_ENABLED)
  		if (swappy_frame_pacer_enable) {
-@@ -3336,6 +3441,13 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
+@@ -3336,6 +3442,13 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
  
  		device_queue.submit_mutex.unlock();
  
@@ -224,7 +225,7 @@ index 63a6690e21..dd7c1d6513 100644
  		// Set the index to an invalid value. If any of the swap chains returned out of date, indicate it should be resized the next time it's acquired.
  		bool any_result_is_out_of_date = false;
  		for (uint32_t i = 0; i < p_swap_chains.size(); i++) {
-@@ -3648,6 +3760,14 @@ void RenderingDeviceDriverVulkan::_swap_chain_release(SwapChain *swap_chain) {
+@@ -3648,6 +3761,14 @@ void RenderingDeviceDriverVulkan::_swap_chain_release(SwapChain *swap_chain) {
  			SwappyVk_destroySwapchain(vk_device, swap_chain->vk_swapchain);
  		}
  #endif
@@ -239,12 +240,14 @@ index 63a6690e21..dd7c1d6513 100644
  		device_functions.DestroySwapchainKHR(vk_device, swap_chain->vk_swapchain, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR));
  		swap_chain->vk_swapchain = VK_NULL_HANDLE;
  	}
-@@ -3854,6 +3974,14 @@ Error RenderingDeviceDriverVulkan::swap_chain_resize(CommandQueueID p_cmd_queue,
+@@ -3854,6 +3975,16 @@ Error RenderingDeviceDriverVulkan::swap_chain_resize(CommandQueueID p_cmd_queue,
  	swap_create_info.compositeAlpha = composite_alpha;
  	swap_create_info.presentMode = present_mode;
  	swap_create_info.clipped = true;
 +
-+	// Low latency (emberloom-godot L1): every swap chain opts into NV latency markers when available.
++	// Low latency (emberloom-godot L1): every swap chain opts into NV latency markers when available. The
++	// sleep mode itself stays off until low_latency_set_enabled(true), so the default path only differs by
++	// the opt-in flag (swap chains are not recreated on toggle).
 +	VkSwapchainLatencyCreateInfoNV latency_create_info = {};
 +	if (low_latency.nv_supported) {
 +		latency_create_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV;
@@ -254,7 +257,7 @@ index 63a6690e21..dd7c1d6513 100644
  	err = device_functions.CreateSwapchainKHR(vk_device, &swap_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR), &swap_chain->vk_swapchain);
  	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("Couldn't create Vulkan swapchain (VkResult error %d).", err));
  
-@@ -7495,6 +7623,121 @@ RenderingDeviceDriverVulkan::RenderingDeviceDriverVulkan(RenderingContextDriverV
+@@ -7495,6 +7626,127 @@ RenderingDeviceDriverVulkan::RenderingDeviceDriverVulkan(RenderingContextDriverV
  	max_descriptor_sets_per_pool = GLOBAL_GET("rendering/rendering_device/vulkan/max_descriptors_per_pool");
  }
  
@@ -340,6 +343,11 @@ index 63a6690e21..dd7c1d6513 100644
 +	}
 +	switch (p_marker) {
 +		case LOW_LATENCY_MARKER_INPUT: {
++			if (low_latency.frame_id > low_latency.presented_frame_id) {
++				// The last input stage never reached a present (the main loop did not draw): keep its frame
++				// open instead of stacking input stages without a present stage.
++				return;
++			}
 +			const uint64_t frame = ++low_latency.frame_id;
 +			if (low_latency.amd_supported) {
 +				// The driver delays here so that input is sampled as late as the GPU allows.
@@ -365,7 +373,8 @@ index 63a6690e21..dd7c1d6513 100644
 +			}
 +		} break;
 +		case LOW_LATENCY_MARKER_RENDER_START: {
-+			if (low_latency.nv_supported && low_latency.frame_id > low_latency.presented_frame_id) {
++			if (low_latency.nv_supported && low_latency.frame_id > low_latency.presented_frame_id && low_latency.frame_id > low_latency.render_marked_frame_id) {
++				low_latency.render_marked_frame_id = low_latency.frame_id;
 +				_low_latency_nv_marker(VK_LATENCY_MARKER_SIMULATION_END_NV, low_latency.frame_id);
 +				_low_latency_nv_marker(VK_LATENCY_MARKER_RENDERSUBMIT_START_NV, low_latency.frame_id);
 +			}
@@ -376,7 +385,7 @@ index 63a6690e21..dd7c1d6513 100644
  RenderingDeviceDriverVulkan::~RenderingDeviceDriverVulkan() {
  #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
  	if (breadcrumb_buffer != BufferID()) {
-@@ -7519,6 +7762,10 @@ RenderingDeviceDriverVulkan::~RenderingDeviceDriverVulkan() {
+@@ -7519,6 +7771,10 @@ RenderingDeviceDriverVulkan::~RenderingDeviceDriverVulkan() {
  	}
  
  	if (vk_device != VK_NULL_HANDLE) {
@@ -388,10 +397,10 @@ index 63a6690e21..dd7c1d6513 100644
  	}
  }
 diff --git a/drivers/vulkan/rendering_device_driver_vulkan.h b/drivers/vulkan/rendering_device_driver_vulkan.h
-index 6d17386d4e..dd39aff036 100644
+index 6d17386d4e..e25332e994 100644
 --- a/drivers/vulkan/rendering_device_driver_vulkan.h
 +++ b/drivers/vulkan/rendering_device_driver_vulkan.h
-@@ -168,6 +168,33 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
+@@ -168,6 +168,34 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
  	bool pipeline_cache_control_support = false;
  	bool device_fault_support = false;
  	bool framebuffer_depth_resolve = false;
@@ -408,6 +417,7 @@ index 6d17386d4e..dd39aff036 100644
 +		bool nv_mode_dirty = true;
 +		uint64_t frame_id = 0; // Raised at every input marker while enabled.
 +		uint64_t presented_frame_id = 0;
++		uint64_t render_marked_frame_id = 0; // Last frame that got its render-start markers.
 +		VkSwapchainKHR nv_swapchain = VK_NULL_HANDLE; // The first swap chain of the last present.
 +		VkSemaphore nv_semaphore = VK_NULL_HANDLE; // Timeline semaphore signalled by vkLatencySleepNV.
 +		uint64_t nv_semaphore_value = 0;
@@ -425,7 +435,7 @@ index 6d17386d4e..dd39aff036 100644
  #if defined(VK_TRACK_DEVICE_MEMORY)
  	bool device_memory_report_support = false;
  #endif
-@@ -790,6 +817,9 @@ public:
+@@ -790,6 +818,9 @@ public:
  
  	virtual void set_object_name(ObjectType p_type, ID p_driver_id, const String &p_name) override final;
  	virtual uint64_t get_resource_native_handle(DriverResource p_type, ID p_driver_id) override final;
@@ -481,7 +491,7 @@ index 06535cfbd2..f46aec6902 100644
  	delta = frame_step;
  	time += frame_step;
 diff --git a/servers/rendering/rendering_device.cpp b/servers/rendering/rendering_device.cpp
-index 1eab426e8d..c86305212f 100644
+index 1eab426e8d..48c57ba16c 100644
 --- a/servers/rendering/rendering_device.cpp
 +++ b/servers/rendering/rendering_device.cpp
 @@ -8242,6 +8242,13 @@ void RenderingDevice::_execute_frame(bool p_present) {
@@ -498,16 +508,21 @@ index 1eab426e8d..c86305212f 100644
  	}
  }
  
-@@ -8745,6 +8752,37 @@ void RenderingDevice::capture_timestamp(const String &p_name) {
+@@ -8745,6 +8752,42 @@ void RenderingDevice::capture_timestamp(const String &p_name) {
  	frames[frame].timestamp_count++;
  }
  
 +bool RenderingDevice::low_latency_is_supported() {
++	// The input marker sleeps on the main thread while holding the driver's low latency lock, which the present
++	// path also takes: only the single-threaded (Safe) model keeps both on one thread.
++	if (OS::get_singleton()->is_separate_thread_rendering_enabled()) {
++		return false;
++	}
 +	return driver->low_latency_is_supported();
 +}
 +
 +void RenderingDevice::low_latency_set_enabled(bool p_enabled) {
-+	low_latency_enabled = p_enabled && driver->low_latency_is_supported();
++	low_latency_enabled = p_enabled && low_latency_is_supported();
 +	driver->low_latency_set_enabled(low_latency_enabled);
 +}
 +
@@ -536,7 +551,7 @@ index 1eab426e8d..c86305212f 100644
  uint64_t RenderingDevice::get_driver_resource(DriverResource p_resource, RID p_rid, uint64_t p_index) {
  	ERR_RENDER_THREAD_GUARD_V(0);
  
-@@ -9262,6 +9300,11 @@ void RenderingDevice::_bind_methods() {
+@@ -9262,6 +9305,11 @@ void RenderingDevice::_bind_methods() {
  	ClassDB::bind_method(D_METHOD("get_memory_usage", "type"), &RenderingDevice::get_memory_usage);
  
  	ClassDB::bind_method(D_METHOD("get_driver_resource", "resource", "rid", "index"), &RenderingDevice::get_driver_resource);
