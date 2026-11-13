@@ -1,0 +1,120 @@
+From b84cfbc009f08fed896c590fab37c3c173b1bf79 Mon Sep 17 00:00:00 2001
+From: emberloom-godot <emberloom-godot@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:50:18 +0200
+Subject: [PATCH 9/9] Enable Vulkan feature bits for ML upscalers (FSR 4):
+ cooperative matrix, float8, integer dot product, compute derivatives,
+ subgroup size control, 8-bit storage
+
+---
+ .../vulkan/rendering_device_driver_vulkan.cpp | 95 +++++++++++++++++++
+ 1 file changed, 95 insertions(+)
+
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.cpp b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+index 7a56e1a982..c139a1a1ff 100644
+--- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
++++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+@@ -1535,6 +1535,101 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
+ 		create_info_next = &timeline_semaphore_features;
+ 	}
+ 
++	// ML upscalers (emberloom-godot P7; FSR 4 on Vulkan needs feature bits, not only the extensions).
++	// A struct joins the chain only when its extension is enabled (requested through P4's
++	// rendering/rendering_device/vulkan/extra_device_extensions) and the device reports the feature.
++	VkPhysicalDeviceCooperativeMatrixFeaturesKHR ml_coop_matrix = {};
++	VkPhysicalDeviceShaderFloat8FeaturesEXT ml_float8 = {};
++	VkPhysicalDeviceShaderIntegerDotProductFeatures ml_int_dot = {};
++	VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR ml_derivatives = {};
++	VkPhysicalDeviceSubgroupSizeControlFeatures ml_subgroup_size = {};
++	VkPhysicalDevice8BitStorageFeatures ml_storage_8bit = {};
++	{
++		const bool has_coop = enabled_device_extension_names.has(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
++		const bool has_float8 = has_coop && enabled_device_extension_names.has(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
++		const bool has_int_dot = enabled_device_extension_names.has(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
++		const bool has_derivatives = enabled_device_extension_names.has(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
++		const bool has_8bit = enabled_device_extension_names.has(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
++		const bool any_ml = has_coop || has_int_dot || has_derivatives || has_8bit;
++		// Godot requests VK_EXT_subgroup_size_control for its properties only; the feature bits follow an ML request.
++		const bool has_subgroup_size = any_ml && enabled_device_extension_names.has(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
++		const RenderingContextDriverVulkan::Functions &ml_functions = context_driver->functions_get();
++		if (any_ml && ml_functions.GetPhysicalDeviceFeatures2 != nullptr) {
++			void *query_next = nullptr;
++			if (has_coop) {
++				ml_coop_matrix.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
++				ml_coop_matrix.pNext = query_next;
++				query_next = &ml_coop_matrix;
++			}
++			if (has_float8) {
++				ml_float8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
++				ml_float8.pNext = query_next;
++				query_next = &ml_float8;
++			}
++			if (has_int_dot) {
++				ml_int_dot.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
++				ml_int_dot.pNext = query_next;
++				query_next = &ml_int_dot;
++			}
++			if (has_derivatives) {
++				ml_derivatives.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR;
++				ml_derivatives.pNext = query_next;
++				query_next = &ml_derivatives;
++			}
++			if (has_subgroup_size) {
++				ml_subgroup_size.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
++				ml_subgroup_size.pNext = query_next;
++				query_next = &ml_subgroup_size;
++			}
++			if (has_8bit) {
++				ml_storage_8bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
++				ml_storage_8bit.pNext = query_next;
++				query_next = &ml_storage_8bit;
++			}
++			VkPhysicalDeviceFeatures2 ml_query = {};
++			ml_query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
++			ml_query.pNext = query_next;
++			ml_functions.GetPhysicalDeviceFeatures2(physical_device, &ml_query);
++
++			// Re-chain into the create info: only structs whose main bit is reported, with the reported values.
++			const bool coop_on = has_coop && ml_coop_matrix.cooperativeMatrix;
++			const bool float8_on = has_float8 && ml_float8.shaderFloat8;
++			const bool int_dot_on = has_int_dot && ml_int_dot.shaderIntegerDotProduct;
++			const bool derivatives_on = has_derivatives && (ml_derivatives.computeDerivativeGroupQuads || ml_derivatives.computeDerivativeGroupLinear);
++			const bool subgroup_size_on = has_subgroup_size && ml_subgroup_size.subgroupSizeControl;
++			const bool storage_8bit_on = has_8bit && (ml_storage_8bit.storageBuffer8BitAccess || ml_storage_8bit.uniformAndStorageBuffer8BitAccess);
++			if (coop_on) {
++				ml_coop_matrix.cooperativeMatrixRobustBufferAccess = VK_FALSE;
++				ml_coop_matrix.pNext = create_info_next;
++				create_info_next = &ml_coop_matrix;
++			}
++			if (float8_on) {
++				ml_float8.shaderFloat8CooperativeMatrix = (ml_float8.shaderFloat8CooperativeMatrix && coop_on) ? VK_TRUE : VK_FALSE;
++				ml_float8.pNext = create_info_next;
++				create_info_next = &ml_float8;
++			}
++			if (int_dot_on) {
++				ml_int_dot.pNext = create_info_next;
++				create_info_next = &ml_int_dot;
++			}
++			if (derivatives_on) {
++				ml_derivatives.pNext = create_info_next;
++				create_info_next = &ml_derivatives;
++			}
++			if (subgroup_size_on) {
++				ml_subgroup_size.pNext = create_info_next;
++				create_info_next = &ml_subgroup_size;
++			}
++			if (storage_8bit_on) {
++				ml_storage_8bit.pNext = create_info_next;
++				create_info_next = &ml_storage_8bit;
++			}
++			print_verbose(vformat("Vulkan: ML upscaler features: cooperative matrix %s, float8 %s, integer dot product %s, compute derivatives %s, subgroup size control %s, 8-bit storage %s.",
++					coop_on ? "on" : "off", float8_on ? "on" : "off", int_dot_on ? "on" : "off", derivatives_on ? "on" : "off",
++					subgroup_size_on ? "on" : "off", storage_8bit_on ? "on" : "off"));
++		}
++	}
++
+ 	VkDeviceCreateInfo create_info = {};
+ 	create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+ 	create_info.pNext = create_info_next;
+-- 
+2.43.0
+

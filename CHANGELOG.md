@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.7.2-el.3 — 2026-11-13
+
+- Base / flags: unchanged (`4.7.2-stable`, `ed1daf0bf`; `production=yes`; Windows MinGW-GCC).
+- Patch in: P7 `0110-ml-upscaler-device-features` — Vulkan device feature bits for ML upscalers (FSR 4 via the
+  FidelityFX SDK 2.4 Vulkan DLLs): `VK_KHR_cooperative_matrix`, `VK_EXT_shader_float8`,
+  `VK_KHR_shader_integer_dot_product`, `VK_KHR_compute_shader_derivatives`, `VK_EXT_subgroup_size_control`,
+  `VK_KHR_8bit_storage`. Only when the game requests the extension through P4 and the device reports the feature.
+- No API change; stock paths unchanged unless one of those extensions is requested.
+
 ## 4.7.2-el.2 — 2026-11-13
 
 - Base / flags: unchanged (`4.7.2-stable`, `ed1daf0bf`; `production=yes`; Windows MinGW-GCC).
