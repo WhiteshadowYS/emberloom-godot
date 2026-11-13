@@ -1,0 +1,810 @@
+From bb1cc436c645a00ecca003df670ff9f0183ec0b0 Mon Sep 17 00:00:00 2001
+From: emberloom-godot <emberloom-godot@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:35:49 +0200
+Subject: [PATCH] Add a swap chain interposer, reserved frame generation queues
+ and a HUD-less viewport copy (Vulkan)
+
+---
+ core/config/project_settings.cpp              |   1 +
+ doc/classes/ProjectSettings.xml               |   4 +
+ doc/classes/RenderingDevice.xml               |  19 ++
+ doc/classes/RenderingServer.xml               |  15 ++
+ .../vulkan/emberloom_swap_chain_interposer.h  |  62 +++++
+ .../vulkan/rendering_device_driver_vulkan.cpp | 223 ++++++++++++++++--
+ .../vulkan/rendering_device_driver_vulkan.h   |  23 ++
+ servers/rendering/renderer_viewport.cpp       |  68 ++++++
+ servers/rendering/renderer_viewport.h         |   8 +
+ servers/rendering/rendering_device.cpp        |  16 ++
+ servers/rendering/rendering_device.h          |   5 +
+ servers/rendering/rendering_device_driver.h   |   7 +
+ servers/rendering/rendering_server.cpp        |   2 +
+ servers/rendering/rendering_server.h          |   2 +
+ servers/rendering/rendering_server_default.h  |   2 +
+ 15 files changed, 441 insertions(+), 16 deletions(-)
+ create mode 100644 drivers/vulkan/emberloom_swap_chain_interposer.h
+
+diff --git a/core/config/project_settings.cpp b/core/config/project_settings.cpp
+index ee6f9dee70..6791ef41e3 100644
+--- a/core/config/project_settings.cpp
++++ b/core/config/project_settings.cpp
+@@ -1831,6 +1831,7 @@ ProjectSettings::ProjectSettings() {
+ 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/rendering_device/vulkan/max_descriptors_per_pool", PROPERTY_HINT_RANGE, "1,256,1,or_greater"), 64);
+ 	GLOBAL_DEF_RST(PropertyInfo(Variant::PACKED_STRING_ARRAY, "rendering/rendering_device/vulkan/extra_instance_extensions"), PackedStringArray());
+ 	GLOBAL_DEF_RST(PropertyInfo(Variant::PACKED_STRING_ARRAY, "rendering/rendering_device/vulkan/extra_device_extensions"), PackedStringArray());
++	GLOBAL_DEF_RST("rendering/rendering_device/vulkan/reserve_frame_generation_queues", false); // emberloom-godot F1
+ 
+ 	GLOBAL_DEF_RST("rendering/rendering_device/d3d12/max_resource_descriptors", 65536);
+ 	custom_prop_info["rendering/rendering_device/d3d12/max_resource_descriptors"] = PropertyInfo(Variant::INT, "rendering/rendering_device/d3d12/max_resource_descriptors", PROPERTY_HINT_RANGE, "512,1000000");
+diff --git a/doc/classes/ProjectSettings.xml b/doc/classes/ProjectSettings.xml
+index 15a8c32a7b..986f8e3710 100644
+--- a/doc/classes/ProjectSettings.xml
++++ b/doc/classes/ProjectSettings.xml
+@@ -3403,6 +3403,10 @@
+ 			Additional Vulkan device extensions to enable when the device supports them (for example the ones a native upscaler or low-latency SDK loaded by a GDExtension requires). Unsupported names are skipped silently.
+ 			[b]Note:[/b] Changing this property requires a restart to take effect.
+ 		</member>
++		<member name="rendering/rendering_device/vulkan/reserve_frame_generation_queues" type="bool" setter="" getter="" default="false">
++			If [code]true[/code], one extra queue is created in every queue family that has a spare one and kept out of Godot's own use, for a swap chain interposer such as a frame generation swap chain (see [method RenderingDevice.swap_chain_interposer_set]). emberloom-godot F1.
++			[b]Note:[/b] Changing this property requires a restart to take effect.
++		</member>
+ 		<member name="rendering/rendering_device/vulkan/extra_instance_extensions" type="PackedStringArray" setter="" getter="" default="PackedStringArray()">
+ 			Additional Vulkan instance extensions to enable when the loader supports them. Unsupported names are skipped silently.
+ 			[b]Note:[/b] Changing this property requires a restart to take effect.
+diff --git a/doc/classes/RenderingDevice.xml b/doc/classes/RenderingDevice.xml
+index 1128b3ded3..c1c6fd6633 100644
+--- a/doc/classes/RenderingDevice.xml
++++ b/doc/classes/RenderingDevice.xml
+@@ -446,6 +446,12 @@
+ 				Records a call to [param callback] into the render graph at the current position. When the graph is recorded into the native command buffer, [param callback] is called once with that command buffer's native handle (see [constant DRIVER_RESOURCE_COMMAND_BUFFER]) so native SDKs (DLSS, FidelityFX, XeSS) can record their own commands into the frame. [param resources] lists the textures / buffers the callback touches, with one [enum CallbackResourceType] and one [enum CallbackResourceUsage] each; the graph transitions them before the call, and the call is ordered only against these declared resources (with render-graph reordering an undeclared dependency may run out of order). Vulkan only: other drivers return [constant ERR_UNAVAILABLE]. The callback runs on the rendering thread during submission and must not call [RenderingDevice] methods. Must be called on the rendering thread outside of draw, compute and raytracing lists.
+ 			</description>
+ 		</method>
++		<method name="frame_generation_queues_available">
++			<return type="bool" />
++			<description>
++				Returns [code]true[/code] if the device was created with queues reserved for a swap chain interposer ([member ProjectSettings.rendering/rendering_device/vulkan/reserve_frame_generation_queues] and a queue family with a spare queue). Vulkan only (emberloom-godot F1).
++			</description>
++		</method>
+ 		<method name="framebuffer_create">
+ 			<return type="RID" />
+ 			<param index="0" name="textures" type="RID[]" />
+@@ -1109,6 +1115,19 @@
+ 				[b]Note:[/b] Only available in local RenderingDevices.
+ 			</description>
+ 		</method>
++		<method name="swap_chain_interposer_is_active">
++			<return type="bool" />
++			<description>
++				Returns [code]true[/code] if an interposer is set and the last swap chain created came from it (emberloom-godot F1).
++			</description>
++		</method>
++		<method name="swap_chain_interposer_set">
++			<return type="int" enum="Error" />
++			<param index="0" name="interposer" type="int" />
++			<description>
++				Native API for GDExtensions (emberloom-godot F1, Vulkan only): [param interposer] is the address of an [code]EmberloomSwapChainInterposer[/code] ([code]drivers/vulkan/emberloom_swap_chain_interposer.h[/code]) that replaces swap chain creation, image acquisition and presentation, for example a frame generation swap chain. It must stay valid until replaced. [code]0[/code] removes it. Swap chains are recreated on the next frame; if the interposer declines, the stock swap chain is used. Other drivers return [constant ERR_UNAVAILABLE].
++			</description>
++		</method>
+ 		<method name="sync">
+ 			<return type="void" />
+ 			<description>
+diff --git a/doc/classes/RenderingServer.xml b/doc/classes/RenderingServer.xml
+index 5f27e24fc7..e7b653fbac 100644
+--- a/doc/classes/RenderingServer.xml
++++ b/doc/classes/RenderingServer.xml
+@@ -4147,6 +4147,13 @@
+ 				Returns the viewport's last rendered frame.
+ 			</description>
+ 		</method>
++		<method name="viewport_get_hudless_texture" qualifiers="const">
++			<return type="RID" />
++			<param index="0" name="viewport" type="RID" />
++			<description>
++				Returns the [RenderingDevice] texture holding the viewport's HUD-less copy (the render target after the 3D pass, before 2D canvas items), or an invalid [RID] when capture is off or nothing was captured yet (emberloom-godot F1).
++			</description>
++		</method>
+ 		<method name="viewport_get_update_mode" qualifiers="const">
+ 			<return type="int" enum="RenderingServer.ViewportUpdateMode" />
+ 			<param index="0" name="viewport" type="RID" />
+@@ -4290,6 +4297,14 @@
+ 				Sets the viewport's global transformation matrix.
+ 			</description>
+ 		</method>
++		<method name="viewport_set_hudless_capture">
++			<return type="void" />
++			<param index="0" name="viewport" type="RID" />
++			<param index="1" name="enabled" type="bool" />
++			<description>
++				If [code]true[/code], each frame the viewport's render target is copied after the 3D pass and before 2D canvas items into a texture returned by [method viewport_get_hudless_texture] (HUD-less input for frame generation). [RenderingDevice]-based renderers only (emberloom-godot F1).
++			</description>
++		</method>
+ 		<method name="viewport_set_measure_render_time">
+ 			<return type="void" />
+ 			<param index="0" name="viewport" type="RID" />
+diff --git a/drivers/vulkan/emberloom_swap_chain_interposer.h b/drivers/vulkan/emberloom_swap_chain_interposer.h
+new file mode 100644
+index 0000000000..f6d425e4e9
+--- /dev/null
++++ b/drivers/vulkan/emberloom_swap_chain_interposer.h
+@@ -0,0 +1,62 @@
++/**************************************************************************/
++/*  emberloom_swap_chain_interposer.h                                     */
++/**************************************************************************/
++/* emberloom-godot F1: a C ABI that lets a GDExtension replace the Vulkan */
++/* swap chain (vkCreateSwapchainKHR / GetSwapchainImages / Acquire /      */
++/* Present / Destroy) — e.g. the AMD FidelityFX frame generation swap     */
++/* chain. Plain C structs so the extension can mirror them in any language.*/
++/**************************************************************************/
++
++#pragma once
++
++#include "drivers/vulkan/godot_vulkan.h"
++
++#define EMBERLOOM_SWAP_CHAIN_INTERPOSER_VERSION 1
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Same layout as FidelityFX's VkQueueInfoFFXAPI: { queue, family index, optional submit replacement }.
++typedef VkResult (*EmberloomQueueSubmitFn)(uint32_t p_submit_count, const VkSubmitInfo *p_submits, VkFence p_fence);
++typedef struct EmberloomVkQueue {
++	VkQueue queue;
++	uint32_t family_index;
++	// Non-null for a queue Godot also submits to: takes Godot's queue lock (re-entrant from the present call).
++	EmberloomQueueSubmitFn submit;
++} EmberloomVkQueue;
++
++typedef struct EmberloomSwapChainCreateParams {
++	uint32_t version; // EMBERLOOM_SWAP_CHAIN_INTERPOSER_VERSION
++	VkPhysicalDevice physical_device;
++	VkDevice device;
++	PFN_vkGetDeviceProcAddr get_device_proc_addr;
++	const VkSwapchainCreateInfoKHR *create_info; // oldSwapchain is always VK_NULL_HANDLE (Godot releases first).
++	const VkAllocationCallbacks *allocator;
++	EmberloomVkQueue game_queue; // The queue Godot submits the frame and presents on (locked submit).
++	EmberloomVkQueue present_queue; // Reserved for the interposer; supports present to this surface. Godot never uses it.
++	EmberloomVkQueue async_compute_queue; // Reserved compute queue when async_compute_reserved, else the game queue.
++	EmberloomVkQueue image_acquire_queue; // The game queue (locked submit).
++	uint32_t async_compute_reserved;
++} EmberloomSwapChainCreateParams;
++
++typedef struct EmberloomSwapChainFunctions {
++	PFN_vkGetSwapchainImagesKHR get_swapchain_images;
++	PFN_vkAcquireNextImageKHR acquire_next_image;
++	PFN_vkQueuePresentKHR queue_present;
++	// Replaces vkDestroySwapchainKHR; called after the GPU is idle for the swap chain's frames.
++	void (*destroy)(void *p_user, VkDevice p_device, VkSwapchainKHR p_swapchain, const VkAllocationCallbacks *p_allocator);
++	void *destroy_user;
++} EmberloomSwapChainFunctions;
++
++typedef struct EmberloomSwapChainInterposer {
++	uint32_t version; // EMBERLOOM_SWAP_CHAIN_INTERPOSER_VERSION
++	void *user;
++	// Replaces vkCreateSwapchainKHR. VK_SUCCESS → *r_swapchain + every member of *r_functions set. Any error →
++	// Godot creates a stock swap chain for this surface (and logs the result).
++	VkResult (*create)(void *p_user, const EmberloomSwapChainCreateParams *p_params, VkSwapchainKHR *r_swapchain, EmberloomSwapChainFunctions *r_functions);
++} EmberloomSwapChainInterposer;
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.cpp b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+index c139a1a1ff..8f3bd11dfa 100644
+--- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
++++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+@@ -1338,7 +1338,12 @@ Error RenderingDeviceDriverVulkan::_add_queue_create_info(LocalVector<VkDeviceQu
+ 
+ 	VkQueueFlags queue_flags_mask = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+ 	const uint32_t max_queue_count_per_family = 1;
+-	static const float queue_priorities[max_queue_count_per_family] = {};
++	// emberloom-godot F1: with rendering/rendering_device/vulkan/reserve_frame_generation_queues, every family that
++	// has a second queue gets one more, kept out of Godot's own queue pool for a swap chain interposer (frame
++	// generation: present / async compute). Godot's queues stay exactly as before.
++	fg_reserve_queues = GLOBAL_GET("rendering/rendering_device/vulkan/reserve_frame_generation_queues");
++	fg_reserved_queues.clear();
++	static const float queue_priorities[max_queue_count_per_family + 1] = {};
+ 	for (uint32_t i = 0; i < queue_family_count; i++) {
+ 		if ((queue_family_properties[i].queueFlags & queue_flags_mask) == 0) {
+ 			// We ignore creating queues in families that don't support any of the operations we require.
+@@ -1350,10 +1355,17 @@ Error RenderingDeviceDriverVulkan::_add_queue_create_info(LocalVector<VkDeviceQu
+ 		create_info.queueFamilyIndex = i;
+ 		create_info.queueCount = MIN(queue_family_properties[i].queueCount, max_queue_count_per_family);
+ 		create_info.pQueuePriorities = queue_priorities;
+-		r_queue_create_info.push_back(create_info);
+ 
+ 		// Prepare the vectors where the queues will be filled out.
+ 		queue_families[i].resize(create_info.queueCount);
++
++		if (fg_reserve_queues && queue_family_properties[i].queueCount > create_info.queueCount) {
++			ReservedQueue reserved;
++			reserved.family_index = i;
++			fg_reserved_queues.push_back(reserved);
++			create_info.queueCount++;
++		}
++		r_queue_create_info.push_back(create_info);
+ 	}
+ 
+ 	return OK;
+@@ -1653,6 +1665,14 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
+ 		}
+ 	}
+ 
++	// emberloom-godot F1: the reserved queue is the one after Godot's in its family.
++	for (ReservedQueue &reserved : fg_reserved_queues) {
++		vkGetDeviceQueue(vk_device, reserved.family_index, queue_families[reserved.family_index].size(), &reserved.queue);
++	}
++	if (!fg_reserved_queues.is_empty()) {
++		print_verbose(vformat("Vulkan: %d queue(s) reserved for a swap chain interposer (frame generation).", fg_reserved_queues.size()));
++	}
++
+ 	const RenderingContextDriverVulkan::Functions &functions = context_driver->functions_get();
+ 	if (functions.GetDeviceProcAddr != nullptr) {
+ 		// Low latency (emberloom-godot L1).
+@@ -3498,7 +3518,9 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
+ 				low_latency_frame = low_latency.frame_id;
+ 				low_latency.presented_frame_id = low_latency_frame;
+ 				low_latency_amd = low_latency.amd_supported;
+-				if (low_latency.nv_supported) {
++				// NV latency calls take the driver swap chain: an interposed one (F1) is not, so the NV mode
++				// stays inactive while an interposer owns the main swap chain.
++				if (low_latency.nv_supported && !((SwapChain *)(p_swap_chains[0].id))->interposed) {
+ 					if (low_latency.nv_swapchain != swapchains[0]) {
+ 						low_latency.nv_swapchain = swapchains[0];
+ 						low_latency.nv_mode_dirty = true;
+@@ -3524,16 +3546,53 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
+ 			present_info.pNext = &present_id_info;
+ 		}
+ 
+-		device_queue.submit_mutex.lock();
+-#if defined(SWAPPY_FRAME_PACING_ENABLED)
+-		if (swappy_frame_pacer_enable) {
+-			err = SwappyVk_queuePresent(device_queue.queue, &present_info);
+-		} else {
+-			err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
++		// Swap chain interposer (emberloom-godot F1): an interposed swap chain is presented through its own
++		// function, one swap chain per call (the handle is not a driver swap chain). The interposer may submit
++		// to this queue from inside the call through the locked submit, so mark the lock as held here.
++		bool any_interposed = false;
++		for (uint32_t i = 0; i < p_swap_chains.size(); i++) {
++			any_interposed = any_interposed || ((SwapChain *)(p_swap_chains[i].id))->interposed;
+ 		}
++
++		device_queue.submit_mutex.lock();
++		if (any_interposed) {
++			fg_game_queue_locked = true;
++			present_info.pNext = nullptr; // No VkPresentIdKHR through the interposer (its own presents carry none).
++			err = VK_SUCCESS;
++			for (uint32_t i = 0; i < p_swap_chains.size(); i++) {
++				SwapChain *swap_chain = (SwapChain *)(p_swap_chains[i].id);
++				VkPresentInfoKHR single_info = present_info;
++				// Only the first present waits: binary semaphores are consumed once, and later presents on the
++				// same queue are ordered after it. Multi-window + interposer is not a supported setup.
++				single_info.waitSemaphoreCount = i == 0 ? present_info.waitSemaphoreCount : 0;
++				single_info.pWaitSemaphores = i == 0 ? present_info.pWaitSemaphores : nullptr;
++				single_info.swapchainCount = 1;
++				single_info.pSwapchains = &swapchains[i];
++				single_info.pImageIndices = &image_indices[i];
++				// `results` is reused thread_local storage: a replacement present may not write pResults.
++				results[i] = VK_SUCCESS;
++				single_info.pResults = &results[i];
++				const PFN_vkQueuePresentKHR queue_present = swap_chain->interposed ? swap_chain->interposed_functions.queue_present : device_functions.QueuePresentKHR;
++				VkResult single_err = queue_present(device_queue.queue, &single_info);
++				if (single_err != VK_SUCCESS && results[i] == VK_SUCCESS) {
++					results[i] = single_err;
++				}
++				if (single_err != VK_SUCCESS && err == VK_SUCCESS) {
++					err = single_err;
++				}
++			}
++			fg_game_queue_locked = false;
++		} else {
++#if defined(SWAPPY_FRAME_PACING_ENABLED)
++			if (swappy_frame_pacer_enable) {
++				err = SwappyVk_queuePresent(device_queue.queue, &present_info);
++			} else {
++				err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
++			}
+ #else
+-		err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
++			err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
+ #endif
++		}
+ 
+ 		device_queue.submit_mutex.unlock();
+ 
+@@ -3864,8 +3923,14 @@ void RenderingDeviceDriverVulkan::_swap_chain_release(SwapChain *swap_chain) {
+ 				low_latency.nv_mode_dirty = true;
+ 			}
+ 		}
+-		device_functions.DestroySwapchainKHR(vk_device, swap_chain->vk_swapchain, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR));
++		if (swap_chain->interposed) {
++			swap_chain->interposed_functions.destroy(swap_chain->interposed_functions.destroy_user, vk_device, swap_chain->vk_swapchain, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR));
++		} else {
++			device_functions.DestroySwapchainKHR(vk_device, swap_chain->vk_swapchain, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR));
++		}
+ 		swap_chain->vk_swapchain = VK_NULL_HANDLE;
++		swap_chain->interposed = false;
++		swap_chain->interposed_functions = {};
+ 	}
+ 
+ 	if (swap_chain->render_pass.id != 0) {
+@@ -4080,8 +4145,42 @@ Error RenderingDeviceDriverVulkan::swap_chain_resize(CommandQueueID p_cmd_queue,
+ 		latency_create_info.latencyModeEnable = VK_TRUE;
+ 		swap_create_info.pNext = &latency_create_info;
+ 	}
+-	err = device_functions.CreateSwapchainKHR(vk_device, &swap_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR), &swap_chain->vk_swapchain);
++	// Swap chain interposer (emberloom-godot F1): offer the creation to the interposer first; any failure falls
++	// back to the stock swap chain.
++	swap_chain->interposer_generation = fg_interposer_generation;
++	swap_chain->interposed = false;
++	swap_chain->interposed_functions = {};
++	err = VK_ERROR_INITIALIZATION_FAILED;
++	if (fg_interposer != nullptr) {
++		EmberloomSwapChainCreateParams params = {};
++		if (_fg_pick_queues(swap_chain->surface, command_queue, params)) {
++			params.create_info = &swap_create_info;
++			EmberloomSwapChainFunctions functions_out = {};
++			VkSwapchainKHR interposed_swapchain = VK_NULL_HANDLE;
++			err = fg_interposer->create(fg_interposer->user, &params, &interposed_swapchain, &functions_out);
++			if (err == VK_SUCCESS && (interposed_swapchain == VK_NULL_HANDLE || functions_out.get_swapchain_images == nullptr || functions_out.acquire_next_image == nullptr || functions_out.queue_present == nullptr || functions_out.destroy == nullptr)) {
++				ERR_PRINT("Vulkan: the swap chain interposer returned an incomplete swap chain; using the stock one.");
++				if (interposed_swapchain != VK_NULL_HANDLE && functions_out.destroy != nullptr) {
++					functions_out.destroy(functions_out.destroy_user, vk_device, interposed_swapchain, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR));
++				}
++				err = VK_ERROR_INITIALIZATION_FAILED;
++			} else if (err == VK_SUCCESS) {
++				swap_chain->vk_swapchain = interposed_swapchain;
++				swap_chain->interposed = true;
++				swap_chain->interposed_functions = functions_out;
++			} else {
++				print_line(vformat("Vulkan: the swap chain interposer declined (VkResult %d); using the stock swap chain.", err));
++			}
++		} else {
++			print_line("Vulkan: no reserved present queue for the swap chain interposer; using the stock swap chain.");
++		}
++	}
++	fg_last_create_interposed = swap_chain->interposed;
++	if (!swap_chain->interposed) {
++		err = device_functions.CreateSwapchainKHR(vk_device, &swap_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR), &swap_chain->vk_swapchain);
++	}
+ 	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("Couldn't create Vulkan swapchain (VkResult error %d).", err));
++	const PFN_vkGetSwapchainImagesKHR get_swapchain_images = swap_chain->interposed ? swap_chain->interposed_functions.get_swapchain_images : device_functions.GetSwapchainImagesKHR;
+ 
+ #if defined(SWAPPY_FRAME_PACING_ENABLED)
+ 	if (swappy_frame_pacer_enable) {
+@@ -4114,11 +4213,11 @@ Error RenderingDeviceDriverVulkan::swap_chain_resize(CommandQueueID p_cmd_queue,
+ #endif
+ 
+ 	uint32_t image_count = 0;
+-	err = device_functions.GetSwapchainImagesKHR(vk_device, swap_chain->vk_swapchain, &image_count, nullptr);
++	err = get_swapchain_images(vk_device, swap_chain->vk_swapchain, &image_count, nullptr);
+ 	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("Couldn't get Vulkan swapchain images (VkResult error %d).", err));
+ 
+ 	swap_chain->images.resize(image_count);
+-	err = device_functions.GetSwapchainImagesKHR(vk_device, swap_chain->vk_swapchain, &image_count, swap_chain->images.ptr());
++	err = get_swapchain_images(vk_device, swap_chain->vk_swapchain, &image_count, swap_chain->images.ptr());
+ 	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("Couldn't get Vulkan swapchain images (VkResult error %d).", err));
+ 
+ 	VkImageViewCreateInfo view_create_info = {};
+@@ -4229,7 +4328,7 @@ RDD::FramebufferID RenderingDeviceDriverVulkan::swap_chain_acquire_framebuffer(C
+ 
+ 	CommandQueue *command_queue = (CommandQueue *)(p_cmd_queue.id);
+ 	SwapChain *swap_chain = (SwapChain *)(p_swap_chain.id);
+-	if ((swap_chain->vk_swapchain == VK_NULL_HANDLE) || context_driver->surface_get_needs_resize(swap_chain->surface)) {
++	if ((swap_chain->vk_swapchain == VK_NULL_HANDLE) || context_driver->surface_get_needs_resize(swap_chain->surface) || swap_chain->interposer_generation != fg_interposer_generation) {
+ 		// The surface does not have a valid swap chain or it indicates it requires a resize.
+ 		r_resize_required = true;
+ 		return FramebufferID();
+@@ -4261,7 +4360,8 @@ RDD::FramebufferID RenderingDeviceDriverVulkan::swap_chain_acquire_framebuffer(C
+ 	swap_chain->command_queues_acquired.push_back(command_queue);
+ 	swap_chain->command_queues_acquired_semaphores.push_back(semaphore_index);
+ 
+-	err = device_functions.AcquireNextImageKHR(vk_device, swap_chain->vk_swapchain, UINT64_MAX, semaphore, VK_NULL_HANDLE, &swap_chain->image_index);
++	const PFN_vkAcquireNextImageKHR acquire_next_image = swap_chain->interposed ? swap_chain->interposed_functions.acquire_next_image : device_functions.AcquireNextImageKHR;
++	err = acquire_next_image(vk_device, swap_chain->vk_swapchain, UINT64_MAX, semaphore, VK_NULL_HANDLE, &swap_chain->image_index);
+ 	if (err == VK_ERROR_OUT_OF_DATE_KHR) {
+ 		// Out of date leaves the semaphore in a signaled state that will never finish, so it's necessary to recreate it.
+ 		bool semaphore_recreated = _recreate_image_semaphore(command_queue, semaphore_index, true);
+@@ -7773,6 +7873,97 @@ void RenderingDeviceDriverVulkan::_low_latency_nv_apply_mode() {
+ 	low_latency.nv_mode_dirty = false;
+ }
+ 
++/******************************************/
++/**** SWAP CHAIN INTERPOSER (emberloom) ****/
++/******************************************/
++
++RenderingDeviceDriverVulkan::Queue *RenderingDeviceDriverVulkan::fg_game_queue = nullptr;
++thread_local bool RenderingDeviceDriverVulkan::fg_game_queue_locked = false;
++
++VkResult RenderingDeviceDriverVulkan::_fg_game_queue_submit(uint32_t p_submit_count, const VkSubmitInfo *p_submits, VkFence p_fence) {
++	Queue *queue = fg_game_queue;
++	ERR_FAIL_NULL_V(queue, VK_ERROR_INITIALIZATION_FAILED);
++	if (fg_game_queue_locked) {
++		// Called from inside the present (this thread holds the queue lock).
++		return vkQueueSubmit(queue->queue, p_submit_count, p_submits, p_fence);
++	}
++	queue->submit_mutex.lock();
++	fg_game_queue_locked = true;
++	VkResult err = vkQueueSubmit(queue->queue, p_submit_count, p_submits, p_fence);
++	fg_game_queue_locked = false;
++	queue->submit_mutex.unlock();
++	return err;
++}
++
++bool RenderingDeviceDriverVulkan::_fg_pick_queues(RenderingContextDriver::SurfaceID p_surface, CommandQueue *p_cmd_queue, EmberloomSwapChainCreateParams &r_params) {
++	const RenderingContextDriverVulkan::Functions &functions = context_driver->functions_get();
++	if (functions.GetDeviceProcAddr == nullptr) {
++		return false;
++	}
++	RenderingContextDriverVulkan::Surface *surface = (RenderingContextDriverVulkan::Surface *)(p_surface);
++	const ReservedQueue *present = nullptr;
++	const ReservedQueue *compute = nullptr;
++	// Present: a reserved queue whose family can present to this surface, graphics families first.
++	for (int pass = 0; pass < 2 && present == nullptr; pass++) {
++		for (const ReservedQueue &reserved : fg_reserved_queues) {
++			const VkQueueFlags flags = queue_family_properties[reserved.family_index].queueFlags;
++			if ((pass == 0) != ((flags & VK_QUEUE_GRAPHICS_BIT) != 0)) {
++				continue;
++			}
++			VkBool32 supported = VK_FALSE;
++			functions.GetPhysicalDeviceSurfaceSupportKHR(physical_device, reserved.family_index, surface->vk_surface, &supported);
++			if (supported) {
++				present = &reserved;
++				break;
++			}
++		}
++	}
++	if (present == nullptr) {
++		return false;
++	}
++	for (const ReservedQueue &reserved : fg_reserved_queues) {
++		if (&reserved != present && (queue_family_properties[reserved.family_index].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
++			compute = &reserved;
++			break;
++		}
++	}
++
++	fg_game_queue = &queue_families[p_cmd_queue->queue_family][p_cmd_queue->queue_index];
++	const EmberloomVkQueue game = { fg_game_queue->queue, p_cmd_queue->queue_family, &RenderingDeviceDriverVulkan::_fg_game_queue_submit };
++
++	r_params.version = EMBERLOOM_SWAP_CHAIN_INTERPOSER_VERSION;
++	r_params.physical_device = physical_device;
++	r_params.device = vk_device;
++	r_params.get_device_proc_addr = functions.GetDeviceProcAddr;
++	r_params.allocator = VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR);
++	r_params.game_queue = game;
++	r_params.present_queue = { present->queue, present->family_index, nullptr };
++	r_params.async_compute_queue = compute != nullptr ? EmberloomVkQueue{ compute->queue, compute->family_index, nullptr } : game;
++	r_params.async_compute_reserved = compute != nullptr ? 1 : 0;
++	r_params.image_acquire_queue = game;
++	return true;
++}
++
++Error RenderingDeviceDriverVulkan::swap_chain_interposer_set(uint64_t p_interposer) {
++	const EmberloomSwapChainInterposer *interposer = (const EmberloomSwapChainInterposer *)(uintptr_t)p_interposer;
++	ERR_FAIL_COND_V_MSG(interposer != nullptr && (interposer->version != EMBERLOOM_SWAP_CHAIN_INTERPOSER_VERSION || interposer->create == nullptr), ERR_INVALID_PARAMETER, "Unknown swap chain interposer version.");
++	if (interposer == fg_interposer) {
++		return OK;
++	}
++	fg_interposer = interposer;
++	// Every swap chain is recreated on its next acquire (RenderingDevice stalls the GPU first).
++	fg_interposer_generation++;
++	return OK;
++}
++
++bool RenderingDeviceDriverVulkan::swap_chain_interposer_is_active() {
++	return fg_interposer != nullptr && fg_last_create_interposed;
++}
++
++bool RenderingDeviceDriverVulkan::frame_generation_queues_available() {
++	return !fg_reserved_queues.is_empty();
++}
++
+ bool RenderingDeviceDriverVulkan::low_latency_is_supported() {
+ 	return low_latency.amd_supported || low_latency.nv_supported;
+ }
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.h b/drivers/vulkan/rendering_device_driver_vulkan.h
+index e25332e994..e031c52846 100644
+--- a/drivers/vulkan/rendering_device_driver_vulkan.h
++++ b/drivers/vulkan/rendering_device_driver_vulkan.h
+@@ -46,6 +46,7 @@
+ #include <thirdparty/vulkan/vk_mem_alloc.h>
+ 
+ #include <drivers/vulkan/godot_vulkan.h>
++#include "drivers/vulkan/emberloom_swap_chain_interposer.h"
+ 
+ class FileAccess;
+ 
+@@ -196,6 +197,21 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
+ 	void _low_latency_amd_update(VkAntiLagStageAMD p_stage, uint64_t p_frame);
+ 	void _low_latency_nv_marker(VkLatencyMarkerNV p_marker, uint64_t p_present_id);
+ 	void _low_latency_nv_apply_mode();
++
++	// Swap chain interposer + reserved queues (emberloom-godot F1, frame generation).
++	struct ReservedQueue {
++		VkQueue queue = VK_NULL_HANDLE;
++		uint32_t family_index = UINT32_MAX;
++	};
++	LocalVector<ReservedQueue> fg_reserved_queues;
++	bool fg_reserve_queues = false;
++	const EmberloomSwapChainInterposer *fg_interposer = nullptr;
++	uint64_t fg_interposer_generation = 0;
++	bool fg_last_create_interposed = false;
++	static Queue *fg_game_queue;
++	static thread_local bool fg_game_queue_locked;
++	static VkResult _fg_game_queue_submit(uint32_t p_submit_count, const VkSubmitInfo *p_submits, VkFence p_fence);
++	bool _fg_pick_queues(RenderingContextDriver::SurfaceID p_surface, CommandQueue *p_cmd_queue, EmberloomSwapChainCreateParams &r_params);
+ #if defined(VK_TRACK_DEVICE_MEMORY)
+ 	bool device_memory_report_support = false;
+ #endif
+@@ -465,6 +481,10 @@ private:
+ 		RenderPassID render_pass;
+ 		int pre_transform_rotation_degrees = 0;
+ 		uint32_t image_index = 0;
++		// Swap chain interposer (emberloom-godot F1): set when the swap chain came from the interposer.
++		bool interposed = false;
++		EmberloomSwapChainFunctions interposed_functions = {};
++		uint64_t interposer_generation = 0;
+ #ifdef ANDROID_ENABLED
+ 		uint64_t refresh_duration = 0;
+ #endif
+@@ -821,6 +841,9 @@ public:
+ 	virtual bool low_latency_is_supported() override final;
+ 	virtual void low_latency_set_enabled(bool p_enabled) override final;
+ 	virtual void low_latency_marker(LowLatencyMarker p_marker) override final;
++	virtual Error swap_chain_interposer_set(uint64_t p_interposer) override final;
++	virtual bool swap_chain_interposer_is_active() override final;
++	virtual bool frame_generation_queues_available() override final;
+ 	virtual uint64_t get_total_memory_used() override final;
+ 	virtual uint64_t get_lazily_memory_used() override final;
+ 	virtual uint64_t limit_get(Limit p_limit) override final;
+diff --git a/servers/rendering/renderer_viewport.cpp b/servers/rendering/renderer_viewport.cpp
+index 6040774219..b9feeae3a1 100644
+--- a/servers/rendering/renderer_viewport.cpp
++++ b/servers/rendering/renderer_viewport.cpp
+@@ -417,6 +417,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
+ 			RSG::texture_storage->render_target_do_clear_request(p_viewport->render_target);
+ 		}
+ 		_draw_3d(p_viewport);
++		_capture_hudless(p_viewport);
+ 	}
+ 
+ 	if (can_draw_2d) {
+@@ -690,6 +691,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
+ 				RSG::scene->render_empty_scene(p_viewport->render_buffers, p_viewport->scenario, p_viewport->shadow_atlas, p_viewport->window_output_max_value);
+ 			} else {
+ 				_draw_3d(p_viewport);
++				_capture_hudless(p_viewport);
+ 			}
+ 			scenario_draw_canvas_bg = false;
+ 		}
+@@ -739,6 +741,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
+ 					RSG::scene->render_empty_scene(p_viewport->render_buffers, p_viewport->scenario, p_viewport->shadow_atlas, p_viewport->window_output_max_value);
+ 				} else {
+ 					_draw_3d(p_viewport);
++					_capture_hudless(p_viewport);
+ 				}
+ 
+ 				scenario_draw_canvas_bg = false;
+@@ -755,6 +758,7 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
+ 				RSG::scene->render_empty_scene(p_viewport->render_buffers, p_viewport->scenario, p_viewport->shadow_atlas, p_viewport->window_output_max_value);
+ 			} else {
+ 				_draw_3d(p_viewport);
++				_capture_hudless(p_viewport);
+ 			}
+ 		}
+ 	}
+@@ -1213,6 +1217,69 @@ void RendererViewport::viewport_reset_accumulation(RID p_viewport) {
+ 	viewport->reset_accumulation = true;
+ }
+ 
++static void _hudless_layout_callback(RenderingDeviceDriver *p_driver, RenderingDeviceDriver::CommandBufferID p_command_buffer, void *p_userdata) {
++	// Nothing to record: declaring the HUD-less copy as sampled makes the render graph leave it in the
++	// shader-read layout at the end of the frame, where a frame generation swap chain reads it at present.
++}
++
++void RendererViewport::viewport_set_hudless_capture(RID p_viewport, bool p_enabled) {
++	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
++	ERR_FAIL_NULL(viewport);
++
++	viewport->hudless_capture = p_enabled && RD::get_singleton() != nullptr;
++	if (!viewport->hudless_capture) {
++		_free_hudless(viewport);
++	}
++}
++
++RID RendererViewport::viewport_get_hudless_texture(RID p_viewport) const {
++	const Viewport *viewport = viewport_owner.get_or_null(p_viewport);
++	ERR_FAIL_NULL_V(viewport, RID());
++	return viewport->hudless_texture;
++}
++
++void RendererViewport::_free_hudless(Viewport *p_viewport) {
++	if (p_viewport->hudless_texture.is_valid() && RD::get_singleton() != nullptr) {
++		RD::get_singleton()->free_rid(p_viewport->hudless_texture);
++	}
++	p_viewport->hudless_texture = RID();
++}
++
++void RendererViewport::_capture_hudless(Viewport *p_viewport) {
++	RenderingDevice *rd = RD::get_singleton();
++	if (!p_viewport->hudless_capture || rd == nullptr) {
++		return;
++	}
++	const RID src = RSG::texture_storage->texture_get_rd_texture(RSG::texture_storage->render_target_get_texture(p_viewport->render_target));
++	if (src.is_null() || !rd->texture_is_valid(src)) {
++		return;
++	}
++	const RD::TextureFormat src_format = rd->texture_get_format(src);
++	if (p_viewport->hudless_texture.is_valid()) {
++		const RD::TextureFormat cur = rd->texture_get_format(p_viewport->hudless_texture);
++		if (cur.width != src_format.width || cur.height != src_format.height || cur.format != src_format.format) {
++			_free_hudless(p_viewport);
++		}
++	}
++	if (p_viewport->hudless_texture.is_null()) {
++		RD::TextureFormat format;
++		format.format = src_format.format;
++		format.width = src_format.width;
++		format.height = src_format.height;
++		format.texture_type = RD::TEXTURE_TYPE_2D;
++		format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
++		p_viewport->hudless_texture = rd->texture_create(format, RD::TextureView());
++		ERR_FAIL_COND(p_viewport->hudless_texture.is_null());
++		rd->set_resource_name(p_viewport->hudless_texture, "HUD-less copy");
++	}
++	rd->texture_copy(src, p_viewport->hudless_texture, Vector3(), Vector3(), Vector3(src_format.width, src_format.height, 1), 0, 0, 0, 0);
++	RD::CallbackResource resource;
++	resource.rid = p_viewport->hudless_texture;
++	resource.type = RD::CALLBACK_RESOURCE_TYPE_TEXTURE;
++	resource.usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE;
++	rd->driver_callback_add(&_hudless_layout_callback, nullptr, VectorView<RD::CallbackResource>(&resource, 1));
++}
++
+ void RendererViewport::viewport_set_size(RID p_viewport, int p_width, int p_height, int p_view_count) {
+ 	ERR_FAIL_COND(p_width < 0 || p_height < 0 || p_view_count < 0);
+ 
+@@ -1789,6 +1856,7 @@ bool RendererViewport::free(RID p_rid) {
+ 	} else if (viewport_owner.owns(p_rid)) {
+ 		Viewport *viewport = viewport_owner.get_or_null(p_rid);
+ 
++		_free_hudless(viewport);
+ 		RSG::texture_storage->render_target_free(viewport->render_target);
+ 		RSG::light_storage->shadow_atlas_free(viewport->shadow_atlas);
+ 		if (viewport->render_buffers.is_valid()) {
+diff --git a/servers/rendering/renderer_viewport.h b/servers/rendering/renderer_viewport.h
+index 00b5ab4a9a..ef4b484921 100644
+--- a/servers/rendering/renderer_viewport.h
++++ b/servers/rendering/renderer_viewport.h
+@@ -69,6 +69,10 @@ public:
+ 		float scaling_3d_scale = 1.0;
+ 		RID scaling_3d_custom_upscaler;
+ 		bool reset_accumulation = false;
++		// emberloom-godot F1: a copy of the render target after the 3D pass, before the 2D canvas (HUD-less scene
++		// for frame generation). RD texture, sampled-ready at the end of the frame.
++		bool hudless_capture = false;
++		RID hudless_texture;
+ 		float fsr_sharpness = 0.2f;
+ 		float texture_mipmap_bias = 0.0f;
+ 		RSE::ViewportAnisotropicFiltering anisotropic_filtering_level = RSE::VIEWPORT_ANISOTROPY_4X;
+@@ -263,6 +267,10 @@ public:
+ 	void viewport_set_scaling_3d_scale(RID p_viewport, float p_scaling_3d_scale);
+ 	void viewport_set_scaling_3d_custom_upscaler(RID p_viewport, RID p_viewport_upscaler);
+ 	void viewport_reset_accumulation(RID p_viewport);
++	void viewport_set_hudless_capture(RID p_viewport, bool p_enabled);
++	RID viewport_get_hudless_texture(RID p_viewport) const;
++	void _capture_hudless(Viewport *p_viewport);
++	void _free_hudless(Viewport *p_viewport);
+ 	void viewport_set_fsr_sharpness(RID p_viewport, float p_sharpness);
+ 	void viewport_set_texture_mipmap_bias(RID p_viewport, float p_mipmap_bias);
+ 	void viewport_set_anisotropic_filtering_level(RID p_viewport, RSE::ViewportAnisotropicFiltering p_anisotropic_filtering_level);
+diff --git a/servers/rendering/rendering_device.cpp b/servers/rendering/rendering_device.cpp
+index 48c57ba16c..ad0a809b37 100644
+--- a/servers/rendering/rendering_device.cpp
++++ b/servers/rendering/rendering_device.cpp
+@@ -8774,6 +8774,19 @@ uint64_t RenderingDevice::low_latency_get_input_to_present_usec() const {
+ 	return low_latency_input_to_present_usec.get();
+ }
+ 
++Error RenderingDevice::swap_chain_interposer_set(uint64_t p_interposer) {
++	_THREAD_SAFE_METHOD_
++	return driver->swap_chain_interposer_set(p_interposer);
++}
++
++bool RenderingDevice::swap_chain_interposer_is_active() {
++	return driver->swap_chain_interposer_is_active();
++}
++
++bool RenderingDevice::frame_generation_queues_available() {
++	return driver->frame_generation_queues_available();
++}
++
+ void RenderingDevice::low_latency_frame_begin() {
+ 	if (low_latency_enabled) {
+ 		// The driver may sleep here (Anti-Lag / NV latency sleep), so the timestamp is taken after it.
+@@ -9310,6 +9323,9 @@ void RenderingDevice::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("low_latency_set_enabled", "enabled"), &RenderingDevice::low_latency_set_enabled);
+ 	ClassDB::bind_method(D_METHOD("low_latency_is_enabled"), &RenderingDevice::low_latency_is_enabled);
+ 	ClassDB::bind_method(D_METHOD("low_latency_get_input_to_present_usec"), &RenderingDevice::low_latency_get_input_to_present_usec);
++	ClassDB::bind_method(D_METHOD("swap_chain_interposer_set", "interposer"), &RenderingDevice::swap_chain_interposer_set);
++	ClassDB::bind_method(D_METHOD("swap_chain_interposer_is_active"), &RenderingDevice::swap_chain_interposer_is_active);
++	ClassDB::bind_method(D_METHOD("frame_generation_queues_available"), &RenderingDevice::frame_generation_queues_available);
+ 	ClassDB::bind_method(D_METHOD("driver_callback_add", "callback", "resources", "resource_types", "resource_usages"), &RenderingDevice::_driver_callback_add_bind);
+ 
+ 	ClassDB::bind_method(D_METHOD("get_perf_report"), &RenderingDevice::get_perf_report);
+diff --git a/servers/rendering/rendering_device.h b/servers/rendering/rendering_device.h
+index 46746bf303..94bf69011e 100644
+--- a/servers/rendering/rendering_device.h
++++ b/servers/rendering/rendering_device.h
+@@ -1974,6 +1974,11 @@ public:
+ 	void low_latency_set_enabled(bool p_enabled);
+ 	bool low_latency_is_enabled() const;
+ 	uint64_t low_latency_get_input_to_present_usec() const;
++
++	// Swap chain interposer (emberloom-godot F1).
++	Error swap_chain_interposer_set(uint64_t p_interposer);
++	bool swap_chain_interposer_is_active();
++	bool frame_generation_queues_available();
+ 	// Called by the OS main loop right before input is processed.
+ 	void low_latency_frame_begin();
+ 	// Called by the renderer when frame recording starts.
+diff --git a/servers/rendering/rendering_device_driver.h b/servers/rendering/rendering_device_driver.h
+index ce16fc376f..dcd2af83c2 100644
+--- a/servers/rendering/rendering_device_driver.h
++++ b/servers/rendering/rendering_device_driver.h
+@@ -944,6 +944,13 @@ public:
+ 	virtual bool low_latency_is_supported() { return false; }
+ 	virtual void low_latency_set_enabled(bool) {}
+ 	virtual void low_latency_marker(LowLatencyMarker) {}
++
++	// Swap chain interposer (emberloom-godot F1): a native `EmberloomSwapChainInterposer *` (Vulkan only) that
++	// replaces swap chain creation / acquire / present, e.g. for frame generation. 0 removes it. Swap chains
++	// are recreated on the next acquire.
++	virtual Error swap_chain_interposer_set(uint64_t) { return ERR_UNAVAILABLE; }
++	virtual bool swap_chain_interposer_is_active() { return false; }
++	virtual bool frame_generation_queues_available() { return false; }
+ 	virtual uint64_t get_total_memory_used() = 0;
+ 	virtual uint64_t get_lazily_memory_used() = 0;
+ 	virtual uint64_t limit_get(Limit p_limit) = 0;
+diff --git a/servers/rendering/rendering_server.cpp b/servers/rendering/rendering_server.cpp
+index 71cc358d2c..6172c8efa9 100644
+--- a/servers/rendering/rendering_server.cpp
++++ b/servers/rendering/rendering_server.cpp
+@@ -2873,6 +2873,8 @@ void RenderingServer::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_scale", "viewport", "scale"), &RenderingServer::viewport_set_scaling_3d_scale);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_custom_upscaler", "viewport", "upscaler"), &RenderingServer::viewport_set_scaling_3d_custom_upscaler);
+ 	ClassDB::bind_method(D_METHOD("viewport_reset_accumulation", "viewport"), &RenderingServer::viewport_reset_accumulation);
++	ClassDB::bind_method(D_METHOD("viewport_set_hudless_capture", "viewport", "enabled"), &RenderingServer::viewport_set_hudless_capture);
++	ClassDB::bind_method(D_METHOD("viewport_get_hudless_texture", "viewport"), &RenderingServer::viewport_get_hudless_texture);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_fsr_sharpness", "viewport", "sharpness"), &RenderingServer::viewport_set_fsr_sharpness);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_texture_mipmap_bias", "viewport", "mipmap_bias"), &RenderingServer::viewport_set_texture_mipmap_bias);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_anisotropic_filtering_level", "viewport", "anisotropic_filtering_level"), &RenderingServer::viewport_set_anisotropic_filtering_level);
+diff --git a/servers/rendering/rendering_server.h b/servers/rendering/rendering_server.h
+index 3cfd9bfe9d..4f36588d06 100644
+--- a/servers/rendering/rendering_server.h
++++ b/servers/rendering/rendering_server.h
+@@ -561,6 +561,8 @@ public:
+ 	virtual void viewport_set_scaling_3d_scale(RID p_viewport, float p_scaling_3d_scale) = 0;
+ 	virtual void viewport_set_scaling_3d_custom_upscaler(RID p_viewport, RID p_viewport_upscaler) = 0;
+ 	virtual void viewport_reset_accumulation(RID p_viewport) = 0;
++	virtual void viewport_set_hudless_capture(RID p_viewport, bool p_enabled) = 0;
++	virtual RID viewport_get_hudless_texture(RID p_viewport) const = 0;
+ 	virtual void viewport_set_fsr_sharpness(RID p_viewport, float p_fsr_sharpness) = 0;
+ 	virtual void viewport_set_texture_mipmap_bias(RID p_viewport, float p_texture_mipmap_bias) = 0;
+ 	virtual void viewport_set_anisotropic_filtering_level(RID p_viewport, RSE::ViewportAnisotropicFiltering p_anisotropic_filtering_level) = 0;
+diff --git a/servers/rendering/rendering_server_default.h b/servers/rendering/rendering_server_default.h
+index 3d94d6ee05..3421ab9b3d 100644
+--- a/servers/rendering/rendering_server_default.h
++++ b/servers/rendering/rendering_server_default.h
+@@ -760,6 +760,8 @@ public:
+ 	FUNC2(viewport_set_scaling_3d_scale, RID, float)
+ 	FUNC2(viewport_set_scaling_3d_custom_upscaler, RID, RID)
+ 	FUNC1(viewport_reset_accumulation, RID)
++	FUNC2(viewport_set_hudless_capture, RID, bool)
++	FUNC1RC(RID, viewport_get_hudless_texture, RID)
+ 	FUNC2(viewport_set_fsr_sharpness, RID, float)
+ 	FUNC2(viewport_set_texture_mipmap_bias, RID, float)
+ 	FUNC2(viewport_set_anisotropic_filtering_level, RID, RSE::ViewportAnisotropicFiltering)
+-- 
+2.43.0
+
