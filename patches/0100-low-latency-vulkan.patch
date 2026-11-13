@@ -1,0 +1,624 @@
+From 75a5dd4c37c42cf802f75366e89098e975d34c4f Mon Sep 17 00:00:00 2001
+From: emberloom-godot <emberloom-godot@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:30:20 +0200
+Subject: [PATCH 8/8] Add Vulkan low latency: VK_AMD_anti_lag and
+ VK_NV_low_latency2
+
+RenderingDevice.low_latency_is_supported / set_enabled / is_enabled and
+low_latency_get_input_to_present_usec. The OS main loop (Linux/BSD, Windows)
+raises an input marker before process_events (Anti-Lag input stage, NV latency
+sleep + simulation start + input sample), the RD compositor a render-start
+marker (simulation end + render submit start), and the Vulkan present path the
+present stage (Anti-Lag present, NV render submit end / present start / end +
+VkPresentIdKHR). Extensions are requested through the extra device extensions
+project setting; NV needs VK_KHR_present_id and timeline semaphores. Off by
+default; unsupported devices and other drivers keep no-op defaults.
+---
+ doc/classes/RenderingDevice.xml               |  25 ++
+ .../vulkan/rendering_device_driver_vulkan.cpp | 256 ++++++++++++++++++
+ .../vulkan/rendering_device_driver_vulkan.h   |  31 +++
+ platform/linuxbsd/os_linuxbsd.cpp             |   5 +
+ platform/windows/os_windows.cpp               |   5 +
+ .../renderer_rd/renderer_compositor_rd.cpp    |   2 +
+ servers/rendering/rendering_device.cpp        |  48 ++++
+ servers/rendering/rendering_device.h          |  17 ++
+ servers/rendering/rendering_device_driver.h   |  10 +
+ 9 files changed, 399 insertions(+)
+
+diff --git a/doc/classes/RenderingDevice.xml b/doc/classes/RenderingDevice.xml
+index ef6c038e4c..1128b3ded3 100644
+--- a/doc/classes/RenderingDevice.xml
++++ b/doc/classes/RenderingDevice.xml
+@@ -818,6 +818,31 @@
+ 				Limits for various graphics hardware can be found in the [url=https://vulkan.gpuinfo.org/]Vulkan Hardware Database[/url].
+ 			</description>
+ 		</method>
++		<method name="low_latency_get_input_to_present_usec" qualifiers="const">
++			<return type="int" />
++			<description>
++				Returns the CPU time in microseconds from the last input sample (taken by the main loop right before input is processed) to the last present call returning. Measured whether or not low latency is enabled. GPU and display time are not included.
++			</description>
++		</method>
++		<method name="low_latency_is_enabled" qualifiers="const">
++			<return type="bool" />
++			<description>
++				Returns [code]true[/code] if the driver low latency mode is active.
++			</description>
++		</method>
++		<method name="low_latency_is_supported">
++			<return type="bool" />
++			<description>
++				Returns [code]true[/code] if the device supports a driver low latency mode ([code]VK_AMD_anti_lag[/code] or [code]VK_NV_low_latency2[/code]). The extensions must be requested through [member ProjectSettings.rendering/rendering_device/vulkan/extra_device_extensions]; [code]VK_NV_low_latency2[/code] also needs [code]VK_KHR_present_id[/code]. Always [code]false[/code] with the separate rendering thread model.
++			</description>
++		</method>
++		<method name="low_latency_set_enabled">
++			<return type="void" />
++			<param index="0" name="enabled" type="bool" />
++			<description>
++				Enables or disables the driver low latency mode. Has no effect when [method low_latency_is_supported] returns [code]false[/code]. Intended for the single-threaded rendering thread model.
++			</description>
++		</method>
+ 		<method name="raytracing_list_begin" experimental="">
+ 			<return type="int" />
+ 			<description>
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.cpp b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+index 63a6690e21..7a56e1a982 100644
+--- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
++++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+@@ -928,6 +928,8 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
+ 		VkPhysicalDeviceRayTracingPipelineFeaturesKHR raytracing_pipeline_features = {};
+ 		VkPhysicalDeviceSynchronization2FeaturesKHR sync_2_features = {};
+ 		VkPhysicalDeviceRayTracingValidationFeaturesNV raytracing_validation_features = {};
++		VkPhysicalDeviceAntiLagFeaturesAMD anti_lag_features = {};
++		VkPhysicalDevicePresentIdFeaturesKHR present_id_features = {};
+ 
+ 		const bool use_1_2_features = physical_device_properties.apiVersion >= VK_API_VERSION_1_2;
+ 		if (use_1_2_features) {
+@@ -1018,11 +1020,27 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
+ 			next_features = &sync_2_features;
+ 		}
+ 
++		// Low latency (emberloom-godot L1).
++		if (enabled_device_extension_names.has(VK_AMD_ANTI_LAG_EXTENSION_NAME)) {
++			anti_lag_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD;
++			anti_lag_features.pNext = next_features;
++			next_features = &anti_lag_features;
++		}
++		if (enabled_device_extension_names.has(VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
++			present_id_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
++			present_id_features.pNext = next_features;
++			next_features = &present_id_features;
++		}
++
+ 		VkPhysicalDeviceFeatures2 device_features_2 = {};
+ 		device_features_2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+ 		device_features_2.pNext = next_features;
+ 		functions.GetPhysicalDeviceFeatures2(physical_device, &device_features_2);
+ 
++		low_latency_anti_lag_feature = enabled_device_extension_names.has(VK_AMD_ANTI_LAG_EXTENSION_NAME) && anti_lag_features.antiLag;
++		low_latency_present_id_feature = enabled_device_extension_names.has(VK_KHR_PRESENT_ID_EXTENSION_NAME) && present_id_features.presentId;
++		low_latency_timeline_feature = use_1_2_features && device_features_vk_1_2.timelineSemaphore;
++
+ 		if (use_1_2_features) {
+ #ifdef MACOS_ENABLED
+ 			ERR_FAIL_COND_V_MSG(!device_features_vk_1_2.shaderSampledImageArrayNonUniformIndexing, ERR_CANT_CREATE, "Your GPU doesn't support shaderSampledImageArrayNonUniformIndexing which is required to use the Vulkan-based renderers in Godot.");
+@@ -1495,6 +1513,28 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
+ 		}
+ 	}
+ 
++	// Low latency (emberloom-godot L1). NV low latency 2 needs present ids and a timeline semaphore.
++	VkPhysicalDeviceAntiLagFeaturesAMD anti_lag_features = {};
++	if (low_latency_anti_lag_feature) {
++		anti_lag_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD;
++		anti_lag_features.pNext = create_info_next;
++		anti_lag_features.antiLag = VK_TRUE;
++		create_info_next = &anti_lag_features;
++	}
++	const bool low_latency_nv = enabled_device_extension_names.has(VK_NV_LOW_LATENCY_2_EXTENSION_NAME) && low_latency_present_id_feature && low_latency_timeline_feature;
++	VkPhysicalDevicePresentIdFeaturesKHR present_id_features = {};
++	VkPhysicalDeviceTimelineSemaphoreFeatures timeline_semaphore_features = {};
++	if (low_latency_nv) {
++		present_id_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
++		present_id_features.pNext = create_info_next;
++		present_id_features.presentId = VK_TRUE;
++		create_info_next = &present_id_features;
++		timeline_semaphore_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
++		timeline_semaphore_features.pNext = create_info_next;
++		timeline_semaphore_features.timelineSemaphore = VK_TRUE;
++		create_info_next = &timeline_semaphore_features;
++	}
++
+ 	VkDeviceCreateInfo create_info = {};
+ 	create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+ 	create_info.pNext = create_info_next;
+@@ -1520,6 +1560,32 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
+ 
+ 	const RenderingContextDriverVulkan::Functions &functions = context_driver->functions_get();
+ 	if (functions.GetDeviceProcAddr != nullptr) {
++		// Low latency (emberloom-godot L1).
++		if (low_latency_anti_lag_feature) {
++			low_latency.AntiLagUpdateAMD = PFN_vkAntiLagUpdateAMD(functions.GetDeviceProcAddr(vk_device, "vkAntiLagUpdateAMD"));
++			low_latency.amd_supported = low_latency.AntiLagUpdateAMD != nullptr;
++		}
++		if (low_latency_nv) {
++			low_latency.SetLatencySleepModeNV = PFN_vkSetLatencySleepModeNV(functions.GetDeviceProcAddr(vk_device, "vkSetLatencySleepModeNV"));
++			low_latency.LatencySleepNV = PFN_vkLatencySleepNV(functions.GetDeviceProcAddr(vk_device, "vkLatencySleepNV"));
++			low_latency.SetLatencyMarkerNV = PFN_vkSetLatencyMarkerNV(functions.GetDeviceProcAddr(vk_device, "vkSetLatencyMarkerNV"));
++			low_latency.WaitSemaphores = PFN_vkWaitSemaphores(functions.GetDeviceProcAddr(vk_device, "vkWaitSemaphores"));
++			if (low_latency.SetLatencySleepModeNV != nullptr && low_latency.LatencySleepNV != nullptr && low_latency.SetLatencyMarkerNV != nullptr && low_latency.WaitSemaphores != nullptr) {
++				VkSemaphoreTypeCreateInfo semaphore_type_info = {};
++				semaphore_type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
++				semaphore_type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
++				semaphore_type_info.initialValue = 0;
++				VkSemaphoreCreateInfo semaphore_info = {};
++				semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
++				semaphore_info.pNext = &semaphore_type_info;
++				VkResult sem_err = vkCreateSemaphore(vk_device, &semaphore_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SEMAPHORE), &low_latency.nv_semaphore);
++				low_latency.nv_supported = sem_err == VK_SUCCESS;
++			}
++		}
++		if (low_latency.amd_supported || low_latency.nv_supported) {
++			print_verbose(vformat("Vulkan: low latency available (AMD anti-lag: %s, NV low latency 2: %s).", low_latency.amd_supported, low_latency.nv_supported));
++		}
++
+ 		device_functions.CreateSwapchainKHR = PFN_vkCreateSwapchainKHR(functions.GetDeviceProcAddr(vk_device, "vkCreateSwapchainKHR"));
+ 		device_functions.DestroySwapchainKHR = PFN_vkDestroySwapchainKHR(functions.GetDeviceProcAddr(vk_device, "vkDestroySwapchainKHR"));
+ 		device_functions.GetSwapchainImagesKHR = PFN_vkGetSwapchainImagesKHR(functions.GetDeviceProcAddr(vk_device, "vkGetSwapchainImagesKHR"));
+@@ -3323,6 +3389,46 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
+ 		present_info.pImageIndices = image_indices.ptr();
+ 		present_info.pResults = results.ptr();
+ 
++		// Low latency (emberloom-godot L1): the present stage of the frame whose input marker ran last.
++		// The first swap chain of the present (the main window for a single-window game) carries the frame id;
++		// the others present without one.
++		uint64_t low_latency_frame = 0;
++		bool low_latency_amd = false;
++		bool low_latency_nv = false;
++		thread_local LocalVector<uint64_t> present_ids;
++		VkPresentIdKHR present_id_info = {};
++		{
++			MutexLock lock(low_latency.mutex);
++			if (low_latency.enabled && low_latency.frame_id > low_latency.presented_frame_id) {
++				low_latency_frame = low_latency.frame_id;
++				low_latency.presented_frame_id = low_latency_frame;
++				low_latency_amd = low_latency.amd_supported;
++				if (low_latency.nv_supported) {
++					if (low_latency.nv_swapchain != swapchains[0]) {
++						low_latency.nv_swapchain = swapchains[0];
++						low_latency.nv_mode_dirty = true;
++					}
++					_low_latency_nv_apply_mode();
++					low_latency_nv = true;
++					_low_latency_nv_marker(VK_LATENCY_MARKER_RENDERSUBMIT_END_NV, low_latency_frame);
++					_low_latency_nv_marker(VK_LATENCY_MARKER_PRESENT_START_NV, low_latency_frame);
++				}
++			}
++		}
++		if (low_latency_amd) {
++			_low_latency_amd_update(VK_ANTI_LAG_STAGE_PRESENT_AMD, low_latency_frame);
++		}
++		if (low_latency_nv) {
++			present_ids.resize(swapchains.size());
++			for (uint32_t i = 0; i < present_ids.size(); i++) {
++				present_ids[i] = i == 0 ? low_latency_frame : 0;
++			}
++			present_id_info.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
++			present_id_info.swapchainCount = present_ids.size();
++			present_id_info.pPresentIds = present_ids.ptr();
++			present_info.pNext = &present_id_info;
++		}
++
+ 		device_queue.submit_mutex.lock();
+ #if defined(SWAPPY_FRAME_PACING_ENABLED)
+ 		if (swappy_frame_pacer_enable) {
+@@ -3336,6 +3442,13 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
+ 
+ 		device_queue.submit_mutex.unlock();
+ 
++		if (low_latency_nv) {
++			MutexLock lock(low_latency.mutex);
++			if (low_latency.nv_swapchain == swapchains[0]) {
++				_low_latency_nv_marker(VK_LATENCY_MARKER_PRESENT_END_NV, low_latency_frame);
++			}
++		}
++
+ 		// Set the index to an invalid value. If any of the swap chains returned out of date, indicate it should be resized the next time it's acquired.
+ 		bool any_result_is_out_of_date = false;
+ 		for (uint32_t i = 0; i < p_swap_chains.size(); i++) {
+@@ -3648,6 +3761,14 @@ void RenderingDeviceDriverVulkan::_swap_chain_release(SwapChain *swap_chain) {
+ 			SwappyVk_destroySwapchain(vk_device, swap_chain->vk_swapchain);
+ 		}
+ #endif
++		{
++			// Low latency (emberloom-godot L1): forget the swap chain before it is gone.
++			MutexLock lock(low_latency.mutex);
++			if (low_latency.nv_swapchain == swap_chain->vk_swapchain) {
++				low_latency.nv_swapchain = VK_NULL_HANDLE;
++				low_latency.nv_mode_dirty = true;
++			}
++		}
+ 		device_functions.DestroySwapchainKHR(vk_device, swap_chain->vk_swapchain, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR));
+ 		swap_chain->vk_swapchain = VK_NULL_HANDLE;
+ 	}
+@@ -3854,6 +3975,16 @@ Error RenderingDeviceDriverVulkan::swap_chain_resize(CommandQueueID p_cmd_queue,
+ 	swap_create_info.compositeAlpha = composite_alpha;
+ 	swap_create_info.presentMode = present_mode;
+ 	swap_create_info.clipped = true;
++
++	// Low latency (emberloom-godot L1): every swap chain opts into NV latency markers when available. The
++	// sleep mode itself stays off until low_latency_set_enabled(true), so the default path only differs by
++	// the opt-in flag (swap chains are not recreated on toggle).
++	VkSwapchainLatencyCreateInfoNV latency_create_info = {};
++	if (low_latency.nv_supported) {
++		latency_create_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV;
++		latency_create_info.latencyModeEnable = VK_TRUE;
++		swap_create_info.pNext = &latency_create_info;
++	}
+ 	err = device_functions.CreateSwapchainKHR(vk_device, &swap_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR), &swap_chain->vk_swapchain);
+ 	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("Couldn't create Vulkan swapchain (VkResult error %d).", err));
+ 
+@@ -7495,6 +7626,127 @@ RenderingDeviceDriverVulkan::RenderingDeviceDriverVulkan(RenderingContextDriverV
+ 	max_descriptor_sets_per_pool = GLOBAL_GET("rendering/rendering_device/vulkan/max_descriptors_per_pool");
+ }
+ 
++/*********************/
++/**** LOW LATENCY ****/
++/*********************/
++
++// emberloom-godot L1: VK_AMD_anti_lag (AMD Windows, RADV) and VK_NV_low_latency2 (NVIDIA).
++// The OS main loop raises the input marker right before input is processed (Anti-Lag input stage /
++// NV latency sleep + simulation start); the renderer raises the render-start marker; the present
++// stage is issued from command_queue_execute_and_present(). Meant for the single-threaded
++// (Safe) rendering thread model: the input marker holds the low latency mutex while it sleeps.
++
++void RenderingDeviceDriverVulkan::_low_latency_amd_update(VkAntiLagStageAMD p_stage, uint64_t p_frame) {
++	VkAntiLagPresentationInfoAMD presentation_info = {};
++	presentation_info.sType = VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD;
++	presentation_info.stage = p_stage;
++	presentation_info.frameIndex = p_frame;
++	VkAntiLagDataAMD data = {};
++	data.sType = VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD;
++	data.mode = VK_ANTI_LAG_MODE_ON_AMD;
++	data.maxFPS = 0; // The engine's own max_fps limiter stays in charge.
++	data.pPresentationInfo = &presentation_info;
++	low_latency.AntiLagUpdateAMD(vk_device, &data);
++}
++
++void RenderingDeviceDriverVulkan::_low_latency_nv_marker(VkLatencyMarkerNV p_marker, uint64_t p_present_id) {
++	// Caller holds low_latency.mutex.
++	if (low_latency.nv_swapchain == VK_NULL_HANDLE || p_present_id == 0) {
++		return;
++	}
++	VkSetLatencyMarkerInfoNV marker_info = {};
++	marker_info.sType = VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV;
++	marker_info.presentID = p_present_id;
++	marker_info.marker = p_marker;
++	low_latency.SetLatencyMarkerNV(vk_device, low_latency.nv_swapchain, &marker_info);
++}
++
++void RenderingDeviceDriverVulkan::_low_latency_nv_apply_mode() {
++	// Caller holds low_latency.mutex.
++	if (!low_latency.nv_mode_dirty || low_latency.nv_swapchain == VK_NULL_HANDLE) {
++		return;
++	}
++	VkLatencySleepModeInfoNV sleep_mode_info = {};
++	sleep_mode_info.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV;
++	sleep_mode_info.lowLatencyMode = low_latency.enabled ? VK_TRUE : VK_FALSE;
++	sleep_mode_info.lowLatencyBoost = VK_FALSE;
++	sleep_mode_info.minimumIntervalUs = 0;
++	VkResult err = low_latency.SetLatencySleepModeNV(vk_device, low_latency.nv_swapchain, &sleep_mode_info);
++	if (err != VK_SUCCESS) {
++		WARN_PRINT_ONCE(vformat("vkSetLatencySleepModeNV failed (VkResult error %d).", err));
++	}
++	low_latency.nv_mode_dirty = false;
++}
++
++bool RenderingDeviceDriverVulkan::low_latency_is_supported() {
++	return low_latency.amd_supported || low_latency.nv_supported;
++}
++
++void RenderingDeviceDriverVulkan::low_latency_set_enabled(bool p_enabled) {
++	MutexLock lock(low_latency.mutex);
++	const bool enabled = p_enabled && (low_latency.amd_supported || low_latency.nv_supported);
++	if (enabled == low_latency.enabled) {
++		return;
++	}
++	low_latency.enabled = enabled;
++	if (low_latency.amd_supported && !enabled) {
++		VkAntiLagDataAMD data = {};
++		data.sType = VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD;
++		data.mode = VK_ANTI_LAG_MODE_OFF_AMD;
++		low_latency.AntiLagUpdateAMD(vk_device, &data);
++	}
++	if (low_latency.nv_supported) {
++		low_latency.nv_mode_dirty = true;
++		_low_latency_nv_apply_mode();
++	}
++}
++
++void RenderingDeviceDriverVulkan::low_latency_marker(LowLatencyMarker p_marker) {
++	MutexLock lock(low_latency.mutex);
++	if (!low_latency.enabled) {
++		return;
++	}
++	switch (p_marker) {
++		case LOW_LATENCY_MARKER_INPUT: {
++			if (low_latency.frame_id > low_latency.presented_frame_id) {
++				// The last input stage never reached a present (the main loop did not draw): keep its frame
++				// open instead of stacking input stages without a present stage.
++				return;
++			}
++			const uint64_t frame = ++low_latency.frame_id;
++			if (low_latency.amd_supported) {
++				// The driver delays here so that input is sampled as late as the GPU allows.
++				_low_latency_amd_update(VK_ANTI_LAG_STAGE_INPUT_AMD, frame);
++			}
++			if (low_latency.nv_supported && low_latency.nv_swapchain != VK_NULL_HANDLE) {
++				const uint64_t value = ++low_latency.nv_semaphore_value;
++				VkLatencySleepInfoNV sleep_info = {};
++				sleep_info.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_INFO_NV;
++				sleep_info.signalSemaphore = low_latency.nv_semaphore;
++				sleep_info.value = value;
++				if (low_latency.LatencySleepNV(vk_device, low_latency.nv_swapchain, &sleep_info) == VK_SUCCESS) {
++					VkSemaphoreWaitInfo wait_info = {};
++					wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
++					wait_info.semaphoreCount = 1;
++					wait_info.pSemaphores = &low_latency.nv_semaphore;
++					wait_info.pValues = &value;
++					// Never stall a frame for long if the driver does not signal (50 ms cap).
++					low_latency.WaitSemaphores(vk_device, &wait_info, 50'000'000);
++				}
++				_low_latency_nv_marker(VK_LATENCY_MARKER_SIMULATION_START_NV, frame);
++				_low_latency_nv_marker(VK_LATENCY_MARKER_INPUT_SAMPLE_NV, frame);
++			}
++		} break;
++		case LOW_LATENCY_MARKER_RENDER_START: {
++			if (low_latency.nv_supported && low_latency.frame_id > low_latency.presented_frame_id && low_latency.frame_id > low_latency.render_marked_frame_id) {
++				low_latency.render_marked_frame_id = low_latency.frame_id;
++				_low_latency_nv_marker(VK_LATENCY_MARKER_SIMULATION_END_NV, low_latency.frame_id);
++				_low_latency_nv_marker(VK_LATENCY_MARKER_RENDERSUBMIT_START_NV, low_latency.frame_id);
++			}
++		} break;
++	}
++}
++
+ RenderingDeviceDriverVulkan::~RenderingDeviceDriverVulkan() {
+ #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
+ 	if (breadcrumb_buffer != BufferID()) {
+@@ -7519,6 +7771,10 @@ RenderingDeviceDriverVulkan::~RenderingDeviceDriverVulkan() {
+ 	}
+ 
+ 	if (vk_device != VK_NULL_HANDLE) {
++		if (low_latency.nv_semaphore != VK_NULL_HANDLE) {
++			vkDestroySemaphore(vk_device, low_latency.nv_semaphore, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SEMAPHORE));
++			low_latency.nv_semaphore = VK_NULL_HANDLE;
++		}
+ 		vkDestroyDevice(vk_device, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_DEVICE));
+ 	}
+ }
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.h b/drivers/vulkan/rendering_device_driver_vulkan.h
+index 6d17386d4e..e25332e994 100644
+--- a/drivers/vulkan/rendering_device_driver_vulkan.h
++++ b/drivers/vulkan/rendering_device_driver_vulkan.h
+@@ -168,6 +168,34 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
+ 	bool pipeline_cache_control_support = false;
+ 	bool device_fault_support = false;
+ 	bool framebuffer_depth_resolve = false;
++
++	// Low latency (emberloom-godot L1). Requested through the P4 project setting
++	// rendering/rendering_device/vulkan/extra_device_extensions; active only when present.
++	bool low_latency_anti_lag_feature = false;
++	bool low_latency_present_id_feature = false;
++	bool low_latency_timeline_feature = false;
++	struct LowLatency {
++		bool amd_supported = false;
++		bool nv_supported = false;
++		bool enabled = false;
++		bool nv_mode_dirty = true;
++		uint64_t frame_id = 0; // Raised at every input marker while enabled.
++		uint64_t presented_frame_id = 0;
++		uint64_t render_marked_frame_id = 0; // Last frame that got its render-start markers.
++		VkSwapchainKHR nv_swapchain = VK_NULL_HANDLE; // The first swap chain of the last present.
++		VkSemaphore nv_semaphore = VK_NULL_HANDLE; // Timeline semaphore signalled by vkLatencySleepNV.
++		uint64_t nv_semaphore_value = 0;
++		PFN_vkAntiLagUpdateAMD AntiLagUpdateAMD = nullptr;
++		PFN_vkSetLatencySleepModeNV SetLatencySleepModeNV = nullptr;
++		PFN_vkLatencySleepNV LatencySleepNV = nullptr;
++		PFN_vkSetLatencyMarkerNV SetLatencyMarkerNV = nullptr;
++		PFN_vkWaitSemaphores WaitSemaphores = nullptr;
++		BinaryMutex mutex;
++	} low_latency;
++
++	void _low_latency_amd_update(VkAntiLagStageAMD p_stage, uint64_t p_frame);
++	void _low_latency_nv_marker(VkLatencyMarkerNV p_marker, uint64_t p_present_id);
++	void _low_latency_nv_apply_mode();
+ #if defined(VK_TRACK_DEVICE_MEMORY)
+ 	bool device_memory_report_support = false;
+ #endif
+@@ -790,6 +818,9 @@ public:
+ 
+ 	virtual void set_object_name(ObjectType p_type, ID p_driver_id, const String &p_name) override final;
+ 	virtual uint64_t get_resource_native_handle(DriverResource p_type, ID p_driver_id) override final;
++	virtual bool low_latency_is_supported() override final;
++	virtual void low_latency_set_enabled(bool p_enabled) override final;
++	virtual void low_latency_marker(LowLatencyMarker p_marker) override final;
+ 	virtual uint64_t get_total_memory_used() override final;
+ 	virtual uint64_t get_lazily_memory_used() override final;
+ 	virtual uint64_t limit_get(Limit p_limit) override final;
+diff --git a/platform/linuxbsd/os_linuxbsd.cpp b/platform/linuxbsd/os_linuxbsd.cpp
+index 43d7129579..153d90d857 100644
+--- a/platform/linuxbsd/os_linuxbsd.cpp
++++ b/platform/linuxbsd/os_linuxbsd.cpp
+@@ -997,6 +997,11 @@ void OS_LinuxBSD::run() {
+ 	while (true) {
+ 		GodotProfileFrameMark;
+ 		GodotProfileZone("OS_LinuxBSD::run");
++#if defined(RD_ENABLED)
++		if (RenderingDevice::get_singleton() != nullptr) {
++			RenderingDevice::get_singleton()->low_latency_frame_begin(); // emberloom-godot L1.
++		}
++#endif
+ 		DisplayServer::get_singleton()->process_events(); // get rid of pending events
+ #ifdef SDL_ENABLED
+ 		if (joypad_sdl) {
+diff --git a/platform/windows/os_windows.cpp b/platform/windows/os_windows.cpp
+index 1cf034bf48..113d3cad28 100644
+--- a/platform/windows/os_windows.cpp
++++ b/platform/windows/os_windows.cpp
+@@ -2349,6 +2349,11 @@ void OS_Windows::run() {
+ 	while (true) {
+ 		GodotProfileFrameMark;
+ 		GodotProfileZone("OS_Windows::run");
++#if defined(RD_ENABLED)
++		if (RenderingDevice::get_singleton() != nullptr) {
++			RenderingDevice::get_singleton()->low_latency_frame_begin(); // emberloom-godot L1.
++		}
++#endif
+ 		DisplayServer::get_singleton()->process_events(); // get rid of pending events
+ 		if (Main::iteration()) {
+ 			break;
+diff --git a/servers/rendering/renderer_rd/renderer_compositor_rd.cpp b/servers/rendering/renderer_rd/renderer_compositor_rd.cpp
+index 06535cfbd2..f46aec6902 100644
+--- a/servers/rendering/renderer_rd/renderer_compositor_rd.cpp
++++ b/servers/rendering/renderer_rd/renderer_compositor_rd.cpp
+@@ -121,6 +121,8 @@ void RendererCompositorRD::blit_render_targets_to_screen(DisplayServerEnums::Win
+ }
+ 
+ void RendererCompositorRD::begin_frame(double frame_step) {
++	RD::get_singleton()->low_latency_render_start(); // emberloom-godot L1.
++
+ 	frame++;
+ 	delta = frame_step;
+ 	time += frame_step;
+diff --git a/servers/rendering/rendering_device.cpp b/servers/rendering/rendering_device.cpp
+index 1eab426e8d..48c57ba16c 100644
+--- a/servers/rendering/rendering_device.cpp
++++ b/servers/rendering/rendering_device.cpp
+@@ -8242,6 +8242,13 @@ void RenderingDevice::_execute_frame(bool p_present) {
+ 		}
+ 
+ 		frames[frame].swap_chains_to_present.clear();
++
++		// Low latency (emberloom-godot L1): CPU time from the input sample to the present call returning.
++		const uint64_t input_usec = low_latency_input_usec.get();
++		const uint64_t now_usec = OS::get_singleton()->get_ticks_usec();
++		if (input_usec != 0 && now_usec >= input_usec) {
++			low_latency_input_to_present_usec.set(now_usec - input_usec);
++		}
+ 	}
+ }
+ 
+@@ -8745,6 +8752,42 @@ void RenderingDevice::capture_timestamp(const String &p_name) {
+ 	frames[frame].timestamp_count++;
+ }
+ 
++bool RenderingDevice::low_latency_is_supported() {
++	// The input marker sleeps on the main thread while holding the driver's low latency lock, which the present
++	// path also takes: only the single-threaded (Safe) model keeps both on one thread.
++	if (OS::get_singleton()->is_separate_thread_rendering_enabled()) {
++		return false;
++	}
++	return driver->low_latency_is_supported();
++}
++
++void RenderingDevice::low_latency_set_enabled(bool p_enabled) {
++	low_latency_enabled = p_enabled && low_latency_is_supported();
++	driver->low_latency_set_enabled(low_latency_enabled);
++}
++
++bool RenderingDevice::low_latency_is_enabled() const {
++	return low_latency_enabled;
++}
++
++uint64_t RenderingDevice::low_latency_get_input_to_present_usec() const {
++	return low_latency_input_to_present_usec.get();
++}
++
++void RenderingDevice::low_latency_frame_begin() {
++	if (low_latency_enabled) {
++		// The driver may sleep here (Anti-Lag / NV latency sleep), so the timestamp is taken after it.
++		driver->low_latency_marker(RDD::LOW_LATENCY_MARKER_INPUT);
++	}
++	low_latency_input_usec.set(OS::get_singleton()->get_ticks_usec());
++}
++
++void RenderingDevice::low_latency_render_start() {
++	if (low_latency_enabled) {
++		driver->low_latency_marker(RDD::LOW_LATENCY_MARKER_RENDER_START);
++	}
++}
++
+ uint64_t RenderingDevice::get_driver_resource(DriverResource p_resource, RID p_rid, uint64_t p_index) {
+ 	ERR_RENDER_THREAD_GUARD_V(0);
+ 
+@@ -9262,6 +9305,11 @@ void RenderingDevice::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("get_memory_usage", "type"), &RenderingDevice::get_memory_usage);
+ 
+ 	ClassDB::bind_method(D_METHOD("get_driver_resource", "resource", "rid", "index"), &RenderingDevice::get_driver_resource);
++
++	ClassDB::bind_method(D_METHOD("low_latency_is_supported"), &RenderingDevice::low_latency_is_supported);
++	ClassDB::bind_method(D_METHOD("low_latency_set_enabled", "enabled"), &RenderingDevice::low_latency_set_enabled);
++	ClassDB::bind_method(D_METHOD("low_latency_is_enabled"), &RenderingDevice::low_latency_is_enabled);
++	ClassDB::bind_method(D_METHOD("low_latency_get_input_to_present_usec"), &RenderingDevice::low_latency_get_input_to_present_usec);
+ 	ClassDB::bind_method(D_METHOD("driver_callback_add", "callback", "resources", "resource_types", "resource_usages"), &RenderingDevice::_driver_callback_add_bind);
+ 
+ 	ClassDB::bind_method(D_METHOD("get_perf_report"), &RenderingDevice::get_perf_report);
+diff --git a/servers/rendering/rendering_device.h b/servers/rendering/rendering_device.h
+index 70a9daab10..46746bf303 100644
+--- a/servers/rendering/rendering_device.h
++++ b/servers/rendering/rendering_device.h
+@@ -37,6 +37,7 @@
+ #include "core/templates/rb_map.h"
+ #include "core/templates/rb_set.h"
+ #include "core/templates/rid_owner.h"
++#include "core/templates/safe_refcount.h"
+ #include "core/variant/type_info.h"
+ #include "core/variant/typed_array.h"
+ #include "servers/display/display_server_enums.h"
+@@ -1962,6 +1963,22 @@ public:
+ 
+ 	uint64_t get_driver_resource(DriverResource p_resource, RID p_rid = RID(), uint64_t p_index = 0);
+ 
++private:
++	// Low latency (emberloom-godot L1).
++	bool low_latency_enabled = false;
++	SafeNumeric<uint64_t> low_latency_input_usec;
++	SafeNumeric<uint64_t> low_latency_input_to_present_usec;
++
++public:
++	bool low_latency_is_supported();
++	void low_latency_set_enabled(bool p_enabled);
++	bool low_latency_is_enabled() const;
++	uint64_t low_latency_get_input_to_present_usec() const;
++	// Called by the OS main loop right before input is processed.
++	void low_latency_frame_begin();
++	// Called by the renderer when frame recording starts.
++	void low_latency_render_start();
++
+ 	String get_driver_and_device_memory_report() const;
+ 
+ 	String get_tracked_object_name(uint32_t p_type_index) const;
+diff --git a/servers/rendering/rendering_device_driver.h b/servers/rendering/rendering_device_driver.h
+index 103bd9976b..ce16fc376f 100644
+--- a/servers/rendering/rendering_device_driver.h
++++ b/servers/rendering/rendering_device_driver.h
+@@ -934,6 +934,16 @@ public:
+ 
+ 	virtual void set_object_name(ObjectType p_type, ID p_driver_id, const String &p_name) = 0;
+ 	virtual uint64_t get_resource_native_handle(DriverResource p_type, ID p_driver_id) = 0;
++
++	// Low latency (emberloom-godot L1): VK_AMD_anti_lag / VK_NV_low_latency2.
++	// Drivers without support keep these defaults (unsupported, no-ops).
++	enum LowLatencyMarker {
++		LOW_LATENCY_MARKER_INPUT, // Frame start, right before input is sampled. May sleep.
++		LOW_LATENCY_MARKER_RENDER_START, // Simulation done, render recording starts.
++	};
++	virtual bool low_latency_is_supported() { return false; }
++	virtual void low_latency_set_enabled(bool) {}
++	virtual void low_latency_marker(LowLatencyMarker) {}
+ 	virtual uint64_t get_total_memory_used() = 0;
+ 	virtual uint64_t get_lazily_memory_used() = 0;
+ 	virtual uint64_t limit_get(Limit p_limit) = 0;
+-- 
+2.43.0
+
