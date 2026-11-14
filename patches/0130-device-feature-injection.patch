@@ -1,0 +1,112 @@
+From f9ad5aa081837d930285f4cfc45eb06178751483 Mon Sep 17 00:00:00 2001
+From: emberloom-godot <emberloom-godot@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 03:10:22 +0200
+Subject: [PATCH] Enable named Vulkan 1.2 / 1.3 device features requested by
+ the project (timelineSemaphore, synchronization2)
+
+---
+ core/config/project_settings.cpp              |  1 +
+ doc/classes/ProjectSettings.xml               |  4 +++
+ .../vulkan/rendering_device_driver_vulkan.cpp | 29 ++++++++++++++++++-
+ .../vulkan/rendering_device_driver_vulkan.h   |  4 +++
+ 4 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/core/config/project_settings.cpp b/core/config/project_settings.cpp
+index 6791ef41e3..a0ebfac321 100644
+--- a/core/config/project_settings.cpp
++++ b/core/config/project_settings.cpp
+@@ -1832,6 +1832,7 @@ ProjectSettings::ProjectSettings() {
+ 	GLOBAL_DEF_RST(PropertyInfo(Variant::PACKED_STRING_ARRAY, "rendering/rendering_device/vulkan/extra_instance_extensions"), PackedStringArray());
+ 	GLOBAL_DEF_RST(PropertyInfo(Variant::PACKED_STRING_ARRAY, "rendering/rendering_device/vulkan/extra_device_extensions"), PackedStringArray());
+ 	GLOBAL_DEF_RST("rendering/rendering_device/vulkan/reserve_frame_generation_queues", false); // emberloom-godot F1
++	GLOBAL_DEF_RST(PropertyInfo(Variant::PACKED_STRING_ARRAY, "rendering/rendering_device/vulkan/extra_device_features"), PackedStringArray()); // emberloom-godot S1
+ 
+ 	GLOBAL_DEF_RST("rendering/rendering_device/d3d12/max_resource_descriptors", 65536);
+ 	custom_prop_info["rendering/rendering_device/d3d12/max_resource_descriptors"] = PropertyInfo(Variant::INT, "rendering/rendering_device/d3d12/max_resource_descriptors", PROPERTY_HINT_RANGE, "512,1000000");
+diff --git a/doc/classes/ProjectSettings.xml b/doc/classes/ProjectSettings.xml
+index 986f8e3710..ee23acac9f 100644
+--- a/doc/classes/ProjectSettings.xml
++++ b/doc/classes/ProjectSettings.xml
+@@ -3407,6 +3407,10 @@
+ 			If [code]true[/code], one extra queue is created in every queue family that has a spare one and kept out of Godot's own use, for a swap chain interposer such as a frame generation swap chain (see [method RenderingDevice.swap_chain_interposer_set]). emberloom-godot F1.
+ 			[b]Note:[/b] Changing this property requires a restart to take effect.
+ 		</member>
++		<member name="rendering/rendering_device/vulkan/extra_device_features" type="PackedStringArray" setter="" getter="" default="PackedStringArray()">
++			Additional Vulkan 1.2 / 1.3 device feature bits to enable when the device reports them, by their [code]VkPhysicalDeviceVulkan12Features[/code] / [code]VkPhysicalDeviceVulkan13Features[/code] member name (for example the ones NVIDIA Streamline reports for DLSS Frame Generation). Supported: [code]timelineSemaphore[/code], [code]synchronization2[/code]; other names are skipped ([code]bufferDeviceAddress[/code] follows its extension).
++			[b]Note:[/b] Changing this property requires a restart to take effect.
++		</member>
+ 		<member name="rendering/rendering_device/vulkan/extra_instance_extensions" type="PackedStringArray" setter="" getter="" default="PackedStringArray()">
+ 			Additional Vulkan instance extensions to enable when the loader supports them. Unsupported names are skipped silently.
+ 			[b]Note:[/b] Changing this property requires a restart to take effect.
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.cpp b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+index 8f3bd11dfa..6bd833aa83 100644
+--- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
++++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+@@ -1014,7 +1014,10 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
+ 			next_features = &raytracing_validation_features;
+ 		}
+ 
+-		if (enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
++		// emberloom-godot S1: feature names requested by the project (core 1.2 / 1.3 bits; no extension needed).
++		const PackedStringArray extra_features = ProjectSettings::get_singleton() != nullptr ? PackedStringArray(GLOBAL_GET("rendering/rendering_device/vulkan/extra_device_features")) : PackedStringArray();
++		const bool want_sync_2 = extra_features.has("synchronization2") && physical_device_properties.apiVersion >= VK_API_VERSION_1_3;
++		if (enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME) || want_sync_2) {
+ 			sync_2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
+ 			sync_2_features.pNext = next_features;
+ 			next_features = &sync_2_features;
+@@ -1040,6 +1043,17 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
+ 		low_latency_anti_lag_feature = enabled_device_extension_names.has(VK_AMD_ANTI_LAG_EXTENSION_NAME) && anti_lag_features.antiLag;
+ 		low_latency_present_id_feature = enabled_device_extension_names.has(VK_KHR_PRESENT_ID_EXTENSION_NAME) && present_id_features.presentId;
+ 		low_latency_timeline_feature = use_1_2_features && device_features_vk_1_2.timelineSemaphore;
++		extra_feature_timeline_semaphore = extra_features.has("timelineSemaphore") && use_1_2_features && device_features_vk_1_2.timelineSemaphore;
++		extra_feature_synchronization_2 = want_sync_2 && sync_2_features.synchronization2;
++		for (const String &name : extra_features) {
++			if (name != "timelineSemaphore" && name != "synchronization2") {
++				// bufferDeviceAddress follows its extension (P4); descriptorIndexing is core 1.2 (no struct to chain).
++				print_verbose(vformat("Vulkan: extra device feature '%s' is not chained by the engine (skipped).", name));
++			}
++		}
++		if (!extra_features.is_empty()) {
++			print_verbose(vformat("Vulkan: extra device features — timelineSemaphore %s, synchronization2 %s.", extra_feature_timeline_semaphore ? "on" : "off", extra_feature_synchronization_2 ? "on" : "off"));
++		}
+ 
+ 		if (use_1_2_features) {
+ #ifdef MACOS_ENABLED
+@@ -1545,6 +1559,19 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
+ 		timeline_semaphore_features.pNext = create_info_next;
+ 		timeline_semaphore_features.timelineSemaphore = VK_TRUE;
+ 		create_info_next = &timeline_semaphore_features;
++	} else if (extra_feature_timeline_semaphore) {
++		// emberloom-godot S1 (the struct is already chained above when NV low latency is on).
++		timeline_semaphore_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
++		timeline_semaphore_features.pNext = create_info_next;
++		timeline_semaphore_features.timelineSemaphore = VK_TRUE;
++		create_info_next = &timeline_semaphore_features;
++	}
++	VkPhysicalDeviceSynchronization2Features extra_sync_2_features = {};
++	if (extra_feature_synchronization_2) {
++		extra_sync_2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
++		extra_sync_2_features.pNext = create_info_next;
++		extra_sync_2_features.synchronization2 = VK_TRUE;
++		create_info_next = &extra_sync_2_features;
+ 	}
+ 
+ 	// ML upscalers (emberloom-godot P7; FSR 4 on Vulkan needs feature bits, not only the extensions).
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.h b/drivers/vulkan/rendering_device_driver_vulkan.h
+index e031c52846..23da1d3848 100644
+--- a/drivers/vulkan/rendering_device_driver_vulkan.h
++++ b/drivers/vulkan/rendering_device_driver_vulkan.h
+@@ -175,6 +175,10 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
+ 	bool low_latency_anti_lag_feature = false;
+ 	bool low_latency_present_id_feature = false;
+ 	bool low_latency_timeline_feature = false;
++	// emberloom-godot S1: feature bits named in rendering/rendering_device/vulkan/extra_device_features (an SDK loaded
++	// by a GDExtension, e.g. NVIDIA Streamline DLSS-G, reports them); enabled only when the device reports them.
++	bool extra_feature_timeline_semaphore = false;
++	bool extra_feature_synchronization_2 = false;
+ 	struct LowLatency {
+ 		bool amd_supported = false;
+ 		bool nv_supported = false;
+-- 
+2.43.0
+
