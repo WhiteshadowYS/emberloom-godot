@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.7.2-el.5 — 2026-11-14
+
+- Base / flags: unchanged (`4.7.2-stable`, `ed1daf0bf`; `production=yes`; Windows MinGW-GCC).
+- Patch in: S1 `0130-device-feature-injection` — project setting
+  `rendering/rendering_device/vulkan/extra_device_features` (PackedStringArray of `VkPhysicalDeviceVulkan12Features` /
+  `VkPhysicalDeviceVulkan13Features` member names): `timelineSemaphore` and `synchronization2` are chained into device
+  creation when the device reports them (build-arena GX11: NVIDIA Streamline DLSS Frame Generation reports both).
+  Other names are skipped (`bufferDeviceAddress` already follows its extension; `descriptorIndexing` is core 1.2).
+- No API change; stock paths unchanged unless the setting names a feature.
+
 ## 4.7.2-el.4 — 2026-11-14
 
 - Base / flags: unchanged (`4.7.2-stable`, `ed1daf0bf`; `production=yes`; Windows MinGW-GCC).
