@@ -1,4 +1,4 @@
-From f9ad5aa081837d930285f4cfc45eb06178751483 Mon Sep 17 00:00:00 2001
+From 9a53f7753a405513781798c6fd6213a37497dbe1 Mon Sep 17 00:00:00 2001
 From: emberloom-godot <emberloom-godot@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 03:10:22 +0200
 Subject: [PATCH] Enable named Vulkan 1.2 / 1.3 device features requested by
@@ -7,9 +7,9 @@ Subject: [PATCH] Enable named Vulkan 1.2 / 1.3 device features requested by
 ---
  core/config/project_settings.cpp              |  1 +
  doc/classes/ProjectSettings.xml               |  4 +++
- .../vulkan/rendering_device_driver_vulkan.cpp | 29 ++++++++++++++++++-
+ .../vulkan/rendering_device_driver_vulkan.cpp | 28 +++++++++++++++++++
  .../vulkan/rendering_device_driver_vulkan.h   |  4 +++
- 4 files changed, 37 insertions(+), 1 deletion(-)
+ 4 files changed, 37 insertions(+)
 
 diff --git a/core/config/project_settings.cpp b/core/config/project_settings.cpp
 index 6791ef41e3..a0ebfac321 100644
@@ -24,7 +24,7 @@ index 6791ef41e3..a0ebfac321 100644
  	GLOBAL_DEF_RST("rendering/rendering_device/d3d12/max_resource_descriptors", 65536);
  	custom_prop_info["rendering/rendering_device/d3d12/max_resource_descriptors"] = PropertyInfo(Variant::INT, "rendering/rendering_device/d3d12/max_resource_descriptors", PROPERTY_HINT_RANGE, "512,1000000");
 diff --git a/doc/classes/ProjectSettings.xml b/doc/classes/ProjectSettings.xml
-index 986f8e3710..ee23acac9f 100644
+index 986f8e3710..1ae1cb175b 100644
 --- a/doc/classes/ProjectSettings.xml
 +++ b/doc/classes/ProjectSettings.xml
 @@ -3407,6 +3407,10 @@
@@ -32,29 +32,28 @@ index 986f8e3710..ee23acac9f 100644
  			[b]Note:[/b] Changing this property requires a restart to take effect.
  		</member>
 +		<member name="rendering/rendering_device/vulkan/extra_device_features" type="PackedStringArray" setter="" getter="" default="PackedStringArray()">
-+			Additional Vulkan 1.2 / 1.3 device feature bits to enable when the device reports them, by their [code]VkPhysicalDeviceVulkan12Features[/code] / [code]VkPhysicalDeviceVulkan13Features[/code] member name (for example the ones NVIDIA Streamline reports for DLSS Frame Generation). Supported: [code]timelineSemaphore[/code], [code]synchronization2[/code]; other names are skipped ([code]bufferDeviceAddress[/code] follows its extension).
++			Additional Vulkan 1.2 / 1.3 device feature bits to enable when the device reports them, by their [code]VkPhysicalDeviceVulkan12Features[/code] / [code]VkPhysicalDeviceVulkan13Features[/code] member name (for example the ones NVIDIA Streamline reports for DLSS Frame Generation). Supported: [code]timelineSemaphore[/code], [code]synchronization2[/code] (only together with [code]VK_KHR_synchronization2[/code] in [member rendering/rendering_device/vulkan/extra_device_extensions]: the instance targets Vulkan 1.2); other names are skipped ([code]bufferDeviceAddress[/code] follows its extension).
 +			[b]Note:[/b] Changing this property requires a restart to take effect.
 +		</member>
  		<member name="rendering/rendering_device/vulkan/extra_instance_extensions" type="PackedStringArray" setter="" getter="" default="PackedStringArray()">
  			Additional Vulkan instance extensions to enable when the loader supports them. Unsupported names are skipped silently.
  			[b]Note:[/b] Changing this property requires a restart to take effect.
 diff --git a/drivers/vulkan/rendering_device_driver_vulkan.cpp b/drivers/vulkan/rendering_device_driver_vulkan.cpp
-index 8f3bd11dfa..6bd833aa83 100644
+index 8f3bd11dfa..18177d8a36 100644
 --- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
 +++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
-@@ -1014,7 +1014,10 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
+@@ -1014,6 +1014,10 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
  			next_features = &raytracing_validation_features;
  		}
  
--		if (enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
-+		// emberloom-godot S1: feature names requested by the project (core 1.2 / 1.3 bits; no extension needed).
++		// emberloom-godot S1: feature names requested by the project. The instance is created for Vulkan 1.2, so a 1.3
++		// bit (synchronization2) needs its KHR extension enabled too (request it through P4); timelineSemaphore is core 1.2.
 +		const PackedStringArray extra_features = ProjectSettings::get_singleton() != nullptr ? PackedStringArray(GLOBAL_GET("rendering/rendering_device/vulkan/extra_device_features")) : PackedStringArray();
-+		const bool want_sync_2 = extra_features.has("synchronization2") && physical_device_properties.apiVersion >= VK_API_VERSION_1_3;
-+		if (enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME) || want_sync_2) {
++		const bool want_sync_2 = extra_features.has("synchronization2") && enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+ 		if (enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
  			sync_2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
  			sync_2_features.pNext = next_features;
- 			next_features = &sync_2_features;
-@@ -1040,6 +1043,17 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
+@@ -1040,6 +1044,17 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
  		low_latency_anti_lag_feature = enabled_device_extension_names.has(VK_AMD_ANTI_LAG_EXTENSION_NAME) && anti_lag_features.antiLag;
  		low_latency_present_id_feature = enabled_device_extension_names.has(VK_KHR_PRESENT_ID_EXTENSION_NAME) && present_id_features.presentId;
  		low_latency_timeline_feature = use_1_2_features && device_features_vk_1_2.timelineSemaphore;
@@ -72,7 +71,7 @@ index 8f3bd11dfa..6bd833aa83 100644
  
  		if (use_1_2_features) {
  #ifdef MACOS_ENABLED
-@@ -1545,6 +1559,19 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
+@@ -1545,6 +1560,19 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
  		timeline_semaphore_features.pNext = create_info_next;
  		timeline_semaphore_features.timelineSemaphore = VK_TRUE;
  		create_info_next = &timeline_semaphore_features;

@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.7.2-el.6 — 2026-11-14
+
+- Base / flags: unchanged.
+- S1 fix (review): `synchronization2` is chained only when `VK_KHR_synchronization2` is enabled (the instance targets
+  Vulkan 1.2, so the 1.3 core bit is not valid without the extension); el.5 chained it on any 1.3-capable device.
+
 ## 4.7.2-el.5 — 2026-11-14
 
 - Base / flags: unchanged (`4.7.2-stable`, `ed1daf0bf`; `production=yes`; Windows MinGW-GCC).
